@@ -2157,6 +2157,8 @@ def _get_captcha_gate() -> asyncio.Semaphore:
 
 CAPTCHA_ERR_RX = re.compile(r"không tải được captcha|tải captcha|làm mới hoặc thử lại", re.I)
 MAX_ATTEMPTS_PER_CODE = 4   # tối đa 4 lần, MỖI LẦN MỘT TAB KHÁC NHAU
+MAX_ROUNDS_PER_CODE = int(os.getenv("MAX_ROUNDS_PER_CODE", "3"))   # code lỗi captcha được chuyển sang tài khoản chưa xong tối đa mấy vòng
+BATCH_MAX_SECONDS = int(os.getenv("BATCH_MAX_SECONDS", "45"))      # quá thời gian này thì thôi (code thường hết hạn rất nhanh)
 CAPTCHA_LOAD_FAIL = "Không tải được captcha"
 
 
@@ -2376,6 +2378,9 @@ async def _run_accounts(accounts, codes: list[str]):
     stats = {"SUCCESS": 0, "FAIL": 0, "RETRY": 0}
     pending: deque[str] = deque(codes)
     running = [0]
+    rounds: dict[str, int] = {}                      # code -> số vòng đã thử (hết lượt vẫn lỗi captcha)
+    tried_acc: dict[str, set[int]] = {}              # code -> các tài khoản đã thử nhưng lỗi captcha
+    batch_deadline = time.monotonic() + BATCH_MAX_SECONDS
 
     # Chia vòng tròn: code thứ i -> tài khoản thứ i % n
     plan: dict[str, int] = {c: acc_ids[i % n_acc] for i, c in enumerate(codes)}
@@ -2390,6 +2395,8 @@ async def _run_accounts(accounts, codes: list[str]):
         cands = [a for a in acc_ids if a not in done and (a, code) not in verdict_tried]
         if not cands:
             return None
+        fresh = [a for a in cands if a not in tried_acc.get(code, ())]
+        cands = fresh or cands                              # ưu tiên tài khoản CHƯA thử code này
         aid = min(cands, key=lambda a: (load_of(a), a))   # chuyển cho tài khoản đang ít code nhất
         plan[code] = aid
         return aid
@@ -2447,6 +2454,14 @@ async def _run_accounts(accounts, codes: list[str]):
         if final is None:
             if aid in done:
                 pending.appendleft(code)     # tài khoản xong bằng code khác -> code này chuyển đi
+                return
+            # Code còn nguyên (chưa dùng) mà tài khoản vẫn đang chờ -> chuyển cho tài khoản chưa xong
+            # thay vì bỏ phí; chỉ bỏ khi đã thử đủ số vòng hoặc quá thời gian.
+            rounds[code] = rounds.get(code, 0) + 1
+            if rounds[code] < MAX_ROUNDS_PER_CODE and time.monotonic() < batch_deadline:
+                tried_acc.setdefault(code, set()).add(aid)
+                plan.pop(code, None)
+                pending.append(code)
                 return
             status = "RETRY"
             note = clean_text(state["last_note"]) or "Chưa vượt qua được bước captcha"
