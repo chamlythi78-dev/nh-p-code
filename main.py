@@ -49,8 +49,8 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "9220244280"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # Phân loại nhóm quét
-TEXT_TARGET_GROUPS = ["official78wins"]
-VIDEO_TARGET_GROUPS = ["FreeCode_78win", "thongbaocvx"]
+TEXT_TARGET_GROUPS = ["official78wins", "thongbaocvx"]
+VIDEO_TARGET_GROUPS = ["FreeCode_78win"]
 ALL_TARGET_GROUPS = TEXT_TARGET_GROUPS + VIDEO_TARGET_GROUPS
 
 TARGET_URL = "https://code78k.online/"
@@ -1294,7 +1294,7 @@ def extract_clean_codes(raw_text: str) -> list[str]:
     có độ dài đúng 6 ký tự.
     """
     clean_codes = []
-    for w in (raw_text or "").split():
+    for w in clean_text(raw_text).split():
         if w.startswith(("http", "#", "@")):
             continue
         if re.search(r"[^a-zA-Z0-9]", w) and re.search(r"[a-zA-Z0-9]", w):
@@ -1584,7 +1584,7 @@ async def start_scanner(session_str: str):
 
     userbot = TelegramClient(StringSession(session_str), API_ID, API_HASH)
 
-    # 1. Các nhóm video (FreeCode_78win, thongbaocvx) -> Chỉ quét video gửi lên
+    # 1. Nhóm video (FreeCode_78win) -> Chỉ quét video gửi lên
     @userbot.on(events.NewMessage(chats=VIDEO_TARGET_GROUPS))
     async def video_scanner_handler(event):
         if not event.message or not event.message.video:
@@ -1598,14 +1598,19 @@ async def start_scanner(session_str: str):
         except Exception as ex:
             print(f"Lỗi quét video: {ex}")
 
-    # 2. Nhóm official78wins -> Chỉ quét tin nhắn văn bản
+    # 2. Nhóm tin nhắn văn bản (official78wins, thongbaocvx) -> Quét tin nhắn code
     @userbot.on(events.NewMessage(chats=TEXT_TARGET_GROUPS))
     async def text_scanner_handler(event):
         if not event.raw_text:
             return
-        codes = extract_clean_codes(event.raw_text)
-        if codes:
-            await dispatch_codes_to_accounts(codes, "Tin nhắn official78wins")
+        try:
+            chat = await event.get_chat()
+            group_name = getattr(chat, "username", None) or "text_group"
+            codes = extract_clean_codes(event.raw_text)
+            if codes:
+                await dispatch_codes_to_accounts(codes, f"Tin nhắn {group_name}")
+        except Exception as ex:
+            print(f"Lỗi quét tin nhắn: {ex}")
 
     await userbot.connect()
     if await userbot.is_user_authorized():
