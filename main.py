@@ -31,7 +31,7 @@ from aiogram.types import (
 from PIL import Image, ImageEnhance
 from playwright.async_api import async_playwright
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import FloodWaitError, PhoneNumberInvalidError, SessionPasswordNeededError
 from telethon.sessions import StringSession
 
 # =====================================================================
@@ -58,6 +58,7 @@ CODE_PRICE = 10000
 MAX_BATCH = 30
 ORDER_TIMEOUT_HOURS = 72
 PAGE_SIZE = 8
+WARM_TAB_COUNT = int(os.getenv("WARM_TAB_COUNT", "4"))
 
 # Hỗ trợ
 SUPPORT_GROUP = "khututricvx"
@@ -155,8 +156,15 @@ ocr = ddddocr.DdddOcr(show_ad=False)
 db_pool: asyncpg.Pool | None = None
 userbot: TelegramClient | None = None
 temp_login_client: TelegramClient | None = None
+login_phone_code_hash: str | None = None
 background_tasks: list[asyncio.Task] = []
 paid_notify_at: dict[int, float] = {}
+
+# Pool tab trình duyệt mở sẵn tới trang nhập code
+_playwright_ctx = None
+_shared_browser = None
+_tab_queue: asyncio.Queue | None = None
+_pool_lock = asyncio.Lock()
 
 
 class BotStates(StatesGroup):
@@ -203,6 +211,98 @@ def now_str() -> str:
 
 def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(VN_TZ).strftime("%H:%M %d/%m/%Y")
+
+
+# =====================================================================
+# QUẢN LÝ POOL TAB TRÌNH DUYỆT MỞ SẴN TRANG NHẬP CODE
+# =====================================================================
+async def _prepare_page_on_target(page, timeout: int = 15000):
+    if page.url.rstrip("/") != TARGET_URL.rstrip("/"):
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=timeout)
+    else:
+        await page.reload(wait_until="domcontentloaded", timeout=timeout)
+
+
+async def _create_warm_page(browser, timeout: int = 15000):
+    page = await browser.new_page()
+    await _prepare_page_on_target(page, timeout=timeout)
+    return page
+
+
+async def init_browser_pool(tab_count: int = WARM_TAB_COUNT):
+    global _playwright_ctx, _shared_browser, _tab_queue
+    async with _pool_lock:
+        if _tab_queue is None:
+            _tab_queue = asyncio.Queue()
+        if _playwright_ctx is None:
+            _playwright_ctx = await async_playwright().start()
+        if _shared_browser is None or not _shared_browser.is_connected():
+            _shared_browser = await _playwright_ctx.chromium.launch(headless=True)
+            while not _tab_queue.empty():
+                try:
+                    _tab_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        target_total = max(1, tab_count)
+        current_total = _tab_queue.qsize()
+        for _ in range(max(0, target_total - current_total)):
+            try:
+                pg = await _create_warm_page(_shared_browser, timeout=15000)
+                await _tab_queue.put(pg)
+            except Exception as ex:
+                print(f"Không mở sẵn được tab trình duyệt: {ex}")
+
+
+async def borrow_warm_page():
+    """Lấy một tab đã mở sẵn trang nhập code từ pool; nếu rỗng thì mở mới."""
+    try:
+        await init_browser_pool(WARM_TAB_COUNT)
+        if _tab_queue and not _tab_queue.empty():
+            page = _tab_queue.get_nowait()
+            if page and not page.is_closed():
+                return page, True
+    except Exception:
+        pass
+    if _shared_browser and _shared_browser.is_connected():
+        page = await _create_warm_page(_shared_browser, timeout=15000)
+        return page, False
+    return None, False
+
+
+async def return_warm_page(page, from_pool: bool):
+    """Nạp lại trang nhập code sẵn cho lượt tiếp theo và trả tab về pool."""
+    if not page or page.is_closed():
+        return
+    if not from_pool or _tab_queue is None:
+        try:
+            await page.close()
+        except Exception:
+            pass
+        return
+    try:
+        await _prepare_page_on_target(page, timeout=12000)
+        await _tab_queue.put(page)
+    except Exception:
+        try:
+            await page.close()
+        except Exception:
+            pass
+        if _shared_browser and _shared_browser.is_connected():
+            try:
+                fresh = await _create_warm_page(_shared_browser, timeout=12000)
+                await _tab_queue.put(fresh)
+            except Exception:
+                pass
+
+
+async def warm_pool_loop():
+    """Giữ pool tab trình duyệt luôn sẵn sàng định kỳ."""
+    while True:
+        try:
+            await init_browser_pool(WARM_TAB_COUNT)
+        except Exception as ex:
+            print(f"Lỗi duy trì pool tab: {ex}")
+        await asyncio.sleep(120)
 
 
 # =====================================================================
@@ -298,40 +398,87 @@ async def add_tx(conn, user_id: int, amount: int, tx_type: str, note: str = ""):
 
 
 # =====================================================================
-# ADMIN: ĐĂNG NHẬP USERBOT
+# ADMIN: ĐĂNG NHẬP USERBOT (HỖ TRỢ GỬI LẠI / SMS OTP)
 # =====================================================================
-@dp.message(Command("login"))
-async def admin_login_start(message: types.Message, state: FSMContext):
-    global temp_login_client
-    if message.from_user.id != ADMIN_ID:
-        return
+async def _request_login_code(message: types.Message, state: FSMContext, force_sms: bool = False):
+    global temp_login_client, login_phone_code_hash
     try:
-        if temp_login_client:
+        if temp_login_client and temp_login_client.is_connected():
             await temp_login_client.disconnect()
         temp_login_client = TelegramClient(StringSession(), API_ID, API_HASH)
         await temp_login_client.connect()
-        await temp_login_client.send_code_request(PHONE_NUMBER)
+
+        if force_sms and login_phone_code_hash:
+            sent = await temp_login_client.send_code_request(PHONE_NUMBER, force_sms=True)
+        else:
+            sent = await temp_login_client.send_code_request(PHONE_NUMBER)
+
+        login_phone_code_hash = getattr(sent, "phone_code_hash", None)
+        delivery_type = type(getattr(sent, "type", None)).__name__ if getattr(sent, "type", None) else "app/sms"
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [inline_btn("Gửi lại qua SMS", "reload", "login:sms"), inline_btn("Gửi lại mã mới", "mail", "login:resend")]
+        ])
         await message.answer(
-            f"{e('mail')} Đã gửi mã OTP về SĐT <code>{escape(PHONE_NUMBER)}</code>.\n"
-            f"{e('lock')} Hãy nhập mã OTP vào đây (thêm chữ <code>a</code> phía trước nếu sợ Telegram chặn, "
-            f"ví dụ: <code>a12345</code>):"
+            f"{e('mail')} Đã yêu cầu gửi mã OTP ({escape(delivery_type)}) tới SĐT <code>{escape(PHONE_NUMBER)}</code>.\n"
+            f"{e('lock')} Hãy nhập mã OTP vào đây (có thể thêm chữ <code>a</code> phía trước, ví dụ: <code>a12345</code>).\n"
+            f"{e('bulb')} Nếu không thấy OTP trong app Telegram, bấm <b>Gửi lại qua SMS</b> hoặc kiểm tra mục <b>Telegram</b> / tin nhắn hệ thống.",
+            reply_markup=kb,
         )
         await state.set_state(BotStates.waiting_for_otp)
+    except FloodWaitError as fw:
+        await message.answer(
+            f"{e('warn')} Telegram đang giới hạn gửi mã (FloodWait): vui lòng đợi <b>{fw.seconds} giây</b> rồi thử lại <code>/login</code>."
+        )
+    except PhoneNumberInvalidError:
+        await message.answer(
+            f"{e('no')} Số điện thoại <code>{escape(PHONE_NUMBER)}</code> không hợp lệ trên Telegram. Kiểm tra biến <code>PHONE_NUMBER</code>."
+        )
     except Exception as ex:
         await message.answer(f"{e('no')} Lỗi gửi OTP: <code>{escape(clean_text(str(ex)))}</code>")
 
 
-@dp.message(BotStates.waiting_for_otp)
-async def admin_login_otp(message: types.Message, state: FSMContext):
-    global temp_login_client
+@dp.message(Command("login"))
+async def admin_login_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    otp = re.sub(r"\D", "", message.text or "")
+    await _request_login_code(message, state, force_sms=False)
+
+
+@dp.callback_query(F.data.startswith("login:"))
+async def cb_login_retry(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer()
+        return
+    action = call.data.split(":", 1)[1]
+    await call.answer("Đang gửi lại yêu cầu mã...")
+    await _request_login_code(call.message, state, force_sms=(action == "sms"))
+
+
+@dp.message(BotStates.waiting_for_otp)
+async def admin_login_otp(message: types.Message, state: FSMContext):
+    global temp_login_client, login_phone_code_hash
+    if message.from_user.id != ADMIN_ID:
+        return
+    raw_text = (message.text or "").strip()
+    if raw_text.startswith("/login"):
+        await _request_login_code(message, state, force_sms=False)
+        return
+
+    otp = re.sub(r"\D", "", raw_text)
     if not otp:
-        await message.answer(f"{e('no')} Mã OTP không hợp lệ, nhập lại:")
+        await message.answer(f"{e('no')} Mã OTP không hợp lệ, nhập lại (ví dụ <code>12345</code> hoặc <code>a12345</code>):")
         return
     try:
-        await temp_login_client.sign_in(PHONE_NUMBER, otp)
+        if not temp_login_client or not temp_login_client.is_connected():
+            await _request_login_code(message, state, force_sms=False)
+            return
+
+        await temp_login_client.sign_in(
+            phone=PHONE_NUMBER,
+            code=otp,
+            phone_code_hash=login_phone_code_hash,
+        )
         session_str = temp_login_client.session.save()
         await save_session(session_str)
         await state.clear()
@@ -344,10 +491,14 @@ async def admin_login_otp(message: types.Message, state: FSMContext):
         await message.answer(f"{e('lock')} Nick có bật mật khẩu 2 bước (2FA). Vui lòng nhập mật khẩu:")
         await state.set_state(BotStates.waiting_for_2fa)
     except Exception as ex:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [inline_btn("Gửi lại qua SMS", "reload", "login:sms"), inline_btn("Gửi lại mã mới", "mail", "login:resend")]
+        ])
         await message.answer(
-            f"{e('no')} Lỗi xác nhận OTP: <code>{escape(clean_text(str(ex)))}</code>\nGõ <code>/login</code> để thử lại."
+            f"{e('no')} Lỗi xác nhận OTP: <code>{escape(clean_text(str(ex)))}</code>\n"
+            f"Bạn có thể nhập lại mã OTP hoặc bấm nút gửi lại bên dưới.",
+            reply_markup=kb,
         )
-        await state.clear()
 
 
 @dp.message(BotStates.waiting_for_2fa)
@@ -1166,6 +1317,71 @@ async def expire_orders_loop():
 # =====================================================================
 # ADMIN
 # =====================================================================
+@dp.message(Command("checkweb"))
+async def admin_check_web(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    status_msg = await message.answer(f"{e('reload')} Đang kiểm tra truy cập <code>{escape(TARGET_URL)}</code>...")
+    t0 = time.perf_counter()
+    page = None
+    from_pool = False
+    try:
+        page, from_pool = await borrow_warm_page()
+        if page is None:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                try:
+                    pg = await browser.new_page()
+                    await pg.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
+                    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                    has_code = await pg.locator('input[placeholder*="Nhập code"]').count() > 0
+                    has_user = await pg.locator('input[placeholder*="Nhập tài khoản"]').count() > 0
+                    has_btn = await pg.locator(
+                        'button, [role="button"], input[type="submit"], a'
+                    ).filter(has_text=re.compile(r"kiểm tra", re.I)).count() > 0
+                    await status_msg.edit_text(
+                        f"{e('ok')} <b>TRUY CẬP WEB THÀNH CÔNG</b> ({elapsed_ms} ms)\n"
+                        f"{SEP}\n"
+                        f"{e('globe')} URL: <code>{escape(pg.url)}</code>\n"
+                        f"{e('pin')} Ô nhập code: <b>{'Có' if has_code else 'Không thấy'}</b>\n"
+                        f"{e('user')} Ô tài khoản: <b>{'Có' if has_user else 'Không thấy'}</b>\n"
+                        f"{e('fast')} Nút kiểm tra: <b>{'Có' if has_btn else 'Không thấy'}</b>\n"
+                        f"{e('pc')} Pool tab sẵn: <b>0/{WARM_TAB_COUNT}</b>"
+                    )
+                finally:
+                    await browser.close()
+            return
+
+        await _prepare_page_on_target(page, timeout=20000)
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        has_code = await page.locator('input[placeholder*="Nhập code"]').count() > 0
+        has_user = await page.locator('input[placeholder*="Nhập tài khoản"]').count() > 0
+        has_btn = await page.locator(
+            'button, [role="button"], input[type="submit"], a'
+        ).filter(has_text=re.compile(r"kiểm tra", re.I)).count() > 0
+        ready_tabs = _tab_queue.qsize() if _tab_queue else 0
+
+        await status_msg.edit_text(
+            f"{e('ok')} <b>TRUY CẬP WEB THÀNH CÔNG</b> ({elapsed_ms} ms)\n"
+            f"{SEP}\n"
+            f"{e('globe')} URL: <code>{escape(page.url)}</code>\n"
+            f"{e('pin')} Ô nhập code: <b>{'Có' if has_code else 'Không thấy'}</b>\n"
+            f"{e('user')} Ô tài khoản: <b>{'Có' if has_user else 'Không thấy'}</b>\n"
+            f"{e('fast')} Nút kiểm tra: <b>{'Có' if has_btn else 'Không thấy'}</b>\n"
+            f"{e('pc')} Pool tab sẵn: <b>{ready_tabs + (1 if from_pool else 0)}/{WARM_TAB_COUNT}</b>"
+        )
+    except Exception as ex:
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        await status_msg.edit_text(
+            f"{e('no')} <b>LỖI TRUY CẬP WEB</b> ({elapsed_ms} ms)\n"
+            f"{SEP}\n"
+            f"{e('globe')} URL: <code>{escape(TARGET_URL)}</code>\n"
+            f"{e('mail')} Chi tiết: <code>{escape(clean_text(str(ex))[:250])}</code>"
+        )
+    finally:
+        await return_warm_page(page, from_pool)
+
+
 @dp.message(Command("nap"))
 async def admin_add_money(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1275,10 +1491,12 @@ async def admin_stats(message: types.Message):
     scanner_status = (
         f"{e('ok')} Đang chạy" if (userbot and userbot.is_connected()) else f"{e('no')} Chưa đăng nhập (/login)"
     )
+    ready_tabs = _tab_queue.qsize() if _tab_queue else 0
     await message.answer(
         f"{e('top')} <b>THỐNG KÊ</b>\n"
         f"{SEP}\n"
         f"{e('pc')} Bộ quét nhóm: {scanner_status}\n"
+        f"{e('globe')} Tab sẵn trên web: <b>{ready_tabs}/{WARM_TAB_COUNT}</b>\n"
         f"{e('shield')} Người dùng: <b>{total_users}</b>\n"
         f"{e('reload')} Tài khoản chờ nhập code: <b>{active_accs}</b>"
     )
@@ -1371,14 +1589,19 @@ async def doc_captcha(img_bytes: bytes) -> str:
 
 
 async def refresh_captcha_image(page, captcha_img, captcha_input):
-    refresh_btn = page.locator('button:has-text("Làm mới ảnh")')
+    refresh_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
+        has_text=re.compile(r"làm mới", re.I)
+    )
     if await refresh_btn.count() > 0:
         await refresh_btn.first.click()
     else:
         await captcha_img.click()
     await page.wait_for_timeout(1000)
     if not await captcha_input.is_visible():
-        await page.click('button:has-text("KIỂM TRA")')
+        check_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
+            has_text=re.compile(r"kiểm tra", re.I)
+        ).first
+        await check_btn.click(timeout=10000)
         await captcha_input.wait_for(state="visible", timeout=8000)
 
 
@@ -1431,10 +1654,21 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
     clean_code = clean_text(code)
     clean_user = clean_text(game_username)
 
-    await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
+    if page.url.rstrip("/") != TARGET_URL.rstrip("/"):
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=15000)
+
+    code_input = page.locator('input[placeholder*="Nhập code"]')
+    user_input = page.locator('input[placeholder*="Nhập tài khoản"]')
+    if await code_input.count() == 0 or await user_input.count() == 0:
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=15000)
+
     await page.fill('input[placeholder*="Nhập code"]', clean_code)
     await page.fill('input[placeholder*="Nhập tài khoản"]', clean_user)
-    await page.click('button:has-text("KIỂM TRA")')
+
+    check_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
+        has_text=re.compile(r"kiểm tra", re.I)
+    ).first
+    await check_btn.click(timeout=12000)
 
     captcha_input = page.locator('input[placeholder*="Nhập mã captcha"]')
     await captcha_input.wait_for(state="visible", timeout=8000)
@@ -1452,8 +1686,11 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
             continue
 
         await captcha_input.fill(captcha_text)
-        await page.click('button:has-text("Xác thực")')
-        await page.wait_for_timeout(1500)
+        verify_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
+            has_text=re.compile(r"xác thực", re.I)
+        ).first
+        await verify_btn.click(timeout=12000)
+        await page.wait_for_timeout(1200)
 
         notice = await get_page_notice(page)
         body_text = (notice or (await page.inner_text("body"))).lower()
@@ -1491,22 +1728,34 @@ async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, 
         print(f"Không gửi được báo cáo cho admin: {ex}")
 
 
+async def _run_codes_on_page(page, codes: list[str], game_username: str, owner_id: int) -> str | None:
+    for code in codes:
+        try:
+            status, note = await thu_mot_code(page, code, game_username)
+        except Exception as ex:
+            first_line = (str(ex) or "").splitlines()[0]
+            status, note = "FAIL", clean_text(first_line) or "Lỗi thao tác trên trang web"
+
+        ok = status == "SUCCESS"
+        await report_attempt_to_admin(code, game_username, owner_id, ok, note)
+        if ok:
+            return code
+    return None
+
+
 async def chay_nhap_code_cho_tai_khoan(codes: list[str], game_username: str, owner_id: int) -> str | None:
+    page, from_pool = await borrow_warm_page()
+    if page is not None:
+        try:
+            return await _run_codes_on_page(page, codes, game_username, owner_id)
+        finally:
+            await return_warm_page(page, from_pool)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        fallback_page = await browser.new_page()
         try:
-            for code in codes:
-                try:
-                    status, note = await thu_mot_code(page, code, game_username)
-                except Exception as ex:
-                    status, note = "FAIL", clean_text(str(ex)) or "Lỗi khi nhập"
-
-                ok = status == "SUCCESS"
-                await report_attempt_to_admin(code, game_username, owner_id, ok, note)
-                if ok:
-                    return code
-            return None
+            return await _run_codes_on_page(fallback_page, codes, game_username, owner_id)
         finally:
             await browser.close()
 
@@ -1568,7 +1817,7 @@ async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
                 await bot.send_message(
                     ADMIN_ID,
                     f"{e('no')} <b>LỖI HỆ THỐNG</b> khi nhập code cho <code>{escape(game_user)}</code>:\n"
-                    f"<code>{escape(clean_text(str(ex)))}</code>",
+                    f"<code>{escape(clean_text(str(ex))[:250])}</code>",
                 )
             except Exception:
                 pass
@@ -1626,6 +1875,7 @@ async def start_scanner(session_str: str):
 async def main():
     await init_db()
     background_tasks.append(asyncio.create_task(expire_orders_loop()))
+    background_tasks.append(asyncio.create_task(warm_pool_loop()))
     saved_session = await get_saved_session()
     if saved_session:
         background_tasks.append(asyncio.create_task(start_scanner(saved_session)))
