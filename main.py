@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from html import escape
 from io import BytesIO
@@ -165,6 +166,36 @@ _playwright_ctx = None
 _shared_browser = None
 _tab_queue: asyncio.Queue | None = None
 _pool_lock = asyncio.Lock()
+_in_use = 0  # số tab của pool đang được mượn
+_tab_refreshed: dict = {}  # tab -> thời điểm nạp lại trang gần nhất
+_account_locks: dict[int, asyncio.Lock] = {}  # mỗi tài khoản chỉ nhập 1 luồng tại một thời điểm
+_dead_codes: dict[str, float] = {}  # code web báo sai/hết hạn -> thời điểm, bỏ qua cho mọi tài khoản
+_fire_tasks: set = set()
+TAB_MAX_AGE = 240  # tab đứng yên quá số giây này sẽ được nạp lại để luôn "tươi"
+DEAD_CODE_TTL = 1800
+DEAD_CODE_RX = re.compile(r"mã code không đúng|code .*hết (lượt|hạn)|code .*đã (được )?sử dụng", re.I)
+
+
+def fire(coro):
+    """Chạy nền (không chặn luồng nhập code), giữ tham chiếu để task không bị dọn mất."""
+    t = asyncio.create_task(coro)
+    _fire_tasks.add(t)
+    t.add_done_callback(_fire_tasks.discard)
+    return t
+
+
+def mark_dead(code: str):
+    _dead_codes[code] = time.time()
+
+
+def is_dead(code: str) -> bool:
+    ts = _dead_codes.get(code)
+    if ts is None:
+        return False
+    if time.time() - ts > DEAD_CODE_TTL:
+        _dead_codes.pop(code, None)
+        return False
+    return True
 
 
 class BotStates(StatesGroup):
@@ -259,6 +290,7 @@ async def _prepare_page_on_target(page, timeout: int = 15000):
         await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=timeout)
     else:
         await page.reload(wait_until="domcontentloaded", timeout=timeout)
+    _tab_refreshed[page] = time.time()
 
 
 async def _create_warm_page(browser, timeout: int = 15000):
@@ -268,7 +300,7 @@ async def _create_warm_page(browser, timeout: int = 15000):
 
 
 async def init_browser_pool(tab_count: int = WARM_TAB_COUNT):
-    global _playwright_ctx, _shared_browser, _tab_queue
+    global _playwright_ctx, _shared_browser, _tab_queue, _in_use
     async with _pool_lock:
         if _tab_queue is None:
             _tab_queue = asyncio.Queue()
@@ -276,13 +308,15 @@ async def init_browser_pool(tab_count: int = WARM_TAB_COUNT):
             _playwright_ctx = await async_playwright().start()
         if _shared_browser is None or not _shared_browser.is_connected():
             _shared_browser = await _playwright_ctx.chromium.launch(headless=True)
+            _in_use = 0
+            _tab_refreshed.clear()
             while not _tab_queue.empty():
                 try:
                     _tab_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
         target_total = max(1, tab_count)
-        current_total = _tab_queue.qsize()
+        current_total = _tab_queue.qsize() + _in_use
         for _ in range(max(0, target_total - current_total)):
             try:
                 pg = await _create_warm_page(_shared_browser, timeout=15000)
@@ -292,12 +326,21 @@ async def init_browser_pool(tab_count: int = WARM_TAB_COUNT):
 
 
 async def borrow_warm_page():
-    """Lấy một tab đã mở sẵn trang nhập code từ pool; nếu rỗng thì mở mới."""
+    """Lấy một tab đã mở sẵn trang nhập code từ pool; nếu đang bận hết thì chờ tab rảnh (tối đa 8s)."""
+    global _in_use
     try:
-        await init_browser_pool(WARM_TAB_COUNT)
-        if _tab_queue and not _tab_queue.empty():
-            page = _tab_queue.get_nowait()
+        if _tab_queue is None or _shared_browser is None or not _shared_browser.is_connected():
+            await init_browser_pool(WARM_TAB_COUNT)
+        while True:
+            try:
+                page = _tab_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                try:
+                    page = await asyncio.wait_for(_tab_queue.get(), timeout=8)
+                except asyncio.TimeoutError:
+                    break
             if page and not page.is_closed():
+                _in_use += 1
                 return page, True
     except Exception:
         pass
@@ -309,6 +352,9 @@ async def borrow_warm_page():
 
 async def return_warm_page(page, from_pool: bool):
     """Nạp lại trang nhập code sẵn cho lượt tiếp theo và trả tab về pool."""
+    global _in_use
+    if from_pool:
+        _in_use = max(0, _in_use - 1)
     if not page or page.is_closed():
         return
     if not from_pool or _tab_queue is None:
@@ -333,14 +379,46 @@ async def return_warm_page(page, from_pool: bool):
                 pass
 
 
+async def _keepalive_tabs():
+    """Kiểm tra từng tab đang rảnh: chết thì bỏ, đứng quá lâu hoặc mất ô nhập thì nạp lại."""
+    if _tab_queue is None:
+        return
+    for _ in range(_tab_queue.qsize()):
+        try:
+            page = _tab_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        keep = True
+        try:
+            if page.is_closed():
+                keep = False
+            else:
+                age = time.time() - _tab_refreshed.get(page, 0)
+                ready = await page.locator('input[placeholder*="Nhập code"]').count() > 0
+                if age > TAB_MAX_AGE or not ready:
+                    await _prepare_page_on_target(page, timeout=12000)
+        except Exception:
+            keep = False
+        if keep:
+            await _tab_queue.put(page)
+        else:
+            _tab_refreshed.pop(page, None)
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+
 async def warm_pool_loop():
-    """Giữ pool tab trình duyệt luôn sẵn sàng định kỳ."""
+    """Giữ pool tab trình duyệt bật sẵn 24/24: tự mở bù tab thiếu, tự làm mới tab cũ/chết."""
     while True:
         try:
             await init_browser_pool(WARM_TAB_COUNT)
+            await _keepalive_tabs()
+            await init_browser_pool(WARM_TAB_COUNT)
         except Exception as ex:
             print(f"Lỗi duy trì pool tab: {ex}")
-        await asyncio.sleep(120)
+        await asyncio.sleep(30)
 
 
 # =====================================================================
@@ -1681,15 +1759,41 @@ async def extract_codes_from_video_message(message) -> list[str]:
         return await asyncio.to_thread(_extract_codes_from_video_file, video_path, tmpdir)
 
 
+CAPTCHA_FORCE_UPPER = True  # captcha của web là chữ HOA + số; đổi thành False nếu web phân biệt hoa/thường
+CAPTCHA_MIN_LEN = 4
+CAPTCHA_MAX_LEN = 6
+
+
+def _ocr_variants(img_bytes: bytes) -> list[bytes]:
+    """Tạo vài bản xử lý ảnh khác nhau của cùng một captcha để OCR bỏ phiếu cho chính xác hơn."""
+    variants = [img_bytes]
+    base = Image.open(BytesIO(img_bytes)).convert("L")
+    w, h = base.size
+    big = base.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
+    v1 = ImageEnhance.Contrast(big).enhance(1.8)
+    v2 = big.point(lambda p: 255 if p > 150 else 0)
+    v3 = ImageEnhance.Contrast(base.resize((w * 2, h * 2), Image.Resampling.LANCZOS)).enhance(2.5)
+    for im in (v1, v2, v3):
+        buf = BytesIO()
+        im.save(buf, format="PNG")
+        variants.append(buf.getvalue())
+    return variants
+
+
 def _ocr_sync(img_bytes: bytes) -> str:
-    img = Image.open(BytesIO(img_bytes)).convert("L")
-    w, h = img.size
-    img = img.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
-    img = ImageEnhance.Contrast(img).enhance(1.8)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    text = ocr.classification(buf.getvalue())
-    return re.sub(r"[^a-zA-Z0-9]", "", text)
+    votes = []
+    for data in _ocr_variants(img_bytes):
+        try:
+            text = re.sub(r"[^a-zA-Z0-9]", "", ocr.classification(data))
+        except Exception:
+            continue
+        if CAPTCHA_FORCE_UPPER:
+            text = text.upper()
+        if CAPTCHA_MIN_LEN <= len(text) <= CAPTCHA_MAX_LEN:
+            votes.append(text)
+    if not votes:
+        return ""  # đọc không ra -> bấm Làm mới ảnh lấy captcha khác, không nộp bừa
+    return Counter(votes).most_common(1)[0][0]
 
 
 async def doc_captcha(img_bytes: bytes) -> str:
@@ -1752,22 +1856,79 @@ async def _has_text_button(page, pattern: str) -> bool:
     return False
 
 
-async def refresh_captcha_image(page, captcha_img, captcha_input):
-    refresh_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
-        has_text=re.compile(r"làm mới", re.I)
-    )
-    if await refresh_btn.count() > 0:
-        await refresh_btn.first.click()
-    else:
-        await captcha_img.click()
-    await page.wait_for_timeout(1000)
-    if not await captcha_input.first.is_visible():
-        return
+async def _find_captcha_element(page, captcha_input):
+    """Tìm đúng ảnh captcha: ảnh nằm ngay phía trên ô 'Nhập mã captcha' trong khung Mã xác thực."""
+    try:
+        ibox = await captcha_input.first.bounding_box()
+        if not ibox:
+            return None
+        cont = captcha_input.first.locator("xpath=ancestor::*[.//img or .//canvas][1]")
+        if await cont.count() == 0:
+            return None
+        imgs = cont.first.locator("img, canvas")
+        best, best_gap = None, None
+        for i in range(await imgs.count()):
+            el = imgs.nth(i)
+            if not await el.is_visible():
+                continue
+            box = await el.bounding_box()
+            if not box or box["width"] < 60 or box["height"] < 20:
+                continue
+            gap = ibox["y"] - (box["y"] + box["height"])
+            if gap < -5 or gap > 200:
+                continue
+            if best_gap is None or gap < best_gap:
+                best, best_gap = el, gap
+        return best
+    except Exception:
+        return None
+
+
+async def _captcha_image_bytes(page, captcha_input) -> bytes:
+    el = await _find_captcha_element(page, captcha_input)
+    if el is not None:
+        return await el.screenshot()
+    # Dự phòng: chụp vùng ngay phía trên ô nhập captcha (ảnh captcha nằm ở đó)
+    ibox = await captcha_input.first.bounding_box()
+    width = ibox["width"]
+    height = width * 0.35
+    y = max(0, ibox["y"] - width * 0.04 - height)
+    return await page.screenshot(clip={"x": ibox["x"], "y": y, "width": width, "height": height})
+
+
+async def refresh_captcha_image(page, captcha_input) -> bool:
+    """Bấm 'Làm mới ảnh' để lấy captcha mới, chờ tới khi ảnh đổi và xoá ô đã nhập."""
+    try:
+        old = await _captcha_image_bytes(page, captcha_input)
+    except Exception:
+        old = b""
+    clicked = await click_text_button(page, r"làm mới", below=captcha_input.first)
+    if not clicked:
+        el = await _find_captcha_element(page, captcha_input)  # web ghi chú: bấm vào ảnh cũng tải lại
+        if el is not None:
+            try:
+                await el.click(timeout=3000)
+                clicked = True
+            except Exception:
+                pass
+    try:
+        await captcha_input.first.fill("")
+    except Exception:
+        pass
+    for _ in range(20):
+        await page.wait_for_timeout(100)
+        try:
+            new = await _captcha_image_bytes(page, captcha_input)
+        except Exception:
+            continue
+        if new and new != old:
+            return True
+    return clicked
 
 
 def _format_notice_lines(raw_text: str) -> str:
     """Làm sạch nội dung thông báo trên web và xoá dòng nút bấm thừa."""
-    ignore_lines = {"đóng", "chăm sóc khách hàng 24/7", "xác thực", "kiểm tra", "làm mới ảnh"}
+    ignore_lines = {"đóng", "chăm sóc khách hàng 24/7", "xác thực", "kiểm tra", "làm mới ảnh", "hủy"}
     cleaned_lines = []
     seen = set()
     for line in (raw_text or "").splitlines():
@@ -1779,23 +1940,22 @@ def _format_notice_lines(raw_text: str) -> str:
         if item.lower() not in seen:
             seen.add(item.lower())
             cleaned_lines.append(item)
-    return " | ".join(cleaned_lines)[:250]
+    return " | ".join(cleaned_lines)[:350]
 
 
-async def get_page_notice(page) -> str:
-    """Lấy đúng nội dung ghi chú/thông báo hiển thị trên web sau khi nhập code."""
-    try:
-        selectors = (
-            ".swal2-popup",
-            ".swal2-html-container",
-            '[role="dialog"]',
-            '[role="alert"]',
-            ".modal-content",
-            ".toast",
-            ".alert",
-            ".notification",
-        )
-        for sel in selectors:
+RESULT_KEYWORDS = (
+    "thành công", "thất bại", "không đúng", "không tồn tại", "không hợp lệ",
+    "đã sử dụng", "đã được", "hết lượt", "hết hạn",
+)
+POPUP_SELECTORS = (
+    ".swal2-popup", '[role="dialog"]', '[role="alert"]', ".modal-content", ".toast", ".alert", ".notification",
+)
+
+
+async def _popup_text(page) -> str:
+    """Đọc nội dung popup đang hiện (khung kết quả kiểu 'Nhận Code Thất Bại!...')."""
+    for sel in POPUP_SELECTORS:
+        try:
             loc = page.locator(sel)
             count = await loc.count()
             for idx in range(count - 1, -1, -1):
@@ -1804,13 +1964,73 @@ async def get_page_notice(page) -> str:
                     txt = _format_notice_lines(await item.inner_text())
                     if txt:
                         return txt
+        except Exception:
+            continue
+    # Popup tự viết của web (không có class chuẩn): tìm theo nút "Đóng" rồi lấy cả khung chứa nó
+    try:
+        close_btn = page.get_by_text(re.compile(r"^\s*đóng\s*$", re.I))
+        total = await close_btn.count()
+        for i in range(total - 1, -1, -1):
+            el = close_btn.nth(i)
+            if not await el.is_visible():
+                continue
+            box = el.locator("xpath=ancestor::*[contains(normalize-space(.), 'Chăm sóc khách hàng')][1]")
+            if await box.count() == 0:
+                box = el.locator("xpath=../..")
+            txt = _format_notice_lines(await box.first.inner_text())
+            if txt:
+                return txt
+    except Exception:
+        pass
+    return ""
+
+
+async def get_page_notice(page) -> str:
+    """Lấy đúng nội dung ghi chú/thông báo hiển thị trên web sau khi nhập code."""
+    try:
+        txt = await _popup_text(page)
+        if txt:
+            return txt
         body = _format_notice_lines(await page.inner_text("body"))
         return body[-250:]
     except Exception:
         return ""
 
 
-async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 4) -> tuple[str, str]:
+async def _captcha_modal_visible(captcha_input) -> bool:
+    try:
+        return await captcha_input.first.is_visible()
+    except Exception:
+        return False
+
+
+async def _wait_after_verify(page, captcha_input, timeout_ms: int = 3500) -> tuple[str, str]:
+    """
+    Sau khi bấm Xác thực:
+      - ("result", text): web hiện popup kết quả (thành công / thất bại + lý do)
+      - ("captcha_wrong", ""): khung Mã xác thực vẫn còn -> nhập sai, bắt nhập lại
+    """
+    deadline = time.perf_counter() + timeout_ms / 1000
+    hidden_since = None
+    while time.perf_counter() < deadline:
+        txt = await _popup_text(page)
+        low = txt.lower()
+        if txt and any(k in low for k in RESULT_KEYWORDS):
+            return "result", txt
+        if await _captcha_modal_visible(captcha_input):
+            hidden_since = None
+        else:
+            if hidden_since is None:
+                hidden_since = time.perf_counter()
+            elif time.perf_counter() - hidden_since > 1.5:
+                return "result", txt or await get_page_notice(page)
+        await page.wait_for_timeout(100)
+    if await _captcha_modal_visible(captcha_input):
+        return "captcha_wrong", ""
+    return "result", await get_page_notice(page)
+
+
+async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 6) -> tuple[str, str]:
     clean_code = clean_text(code)
     clean_user = clean_text(game_username)
 
@@ -1838,41 +2058,41 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
     if not await click_text_button(page, r"kiểm tra", below=user_input.first):
         return "FAIL", "Không tìm thấy nút Kiểm tra trên web"
 
-    # BƯỚC 3: chờ ô captcha hiện ra
+    # BƯỚC 3: chờ khung "Mã xác thực" (ô captcha) hiện ra
     try:
         await captcha_input.first.wait_for(state="visible", timeout=8000)
     except Exception:
-        notice = await get_page_notice(page)
-        return "FAIL", notice or "Bấm Kiểm tra nhưng web không hiện ô captcha"
+        return "FAIL", (await get_page_notice(page)) or "Bấm Kiểm tra nhưng web không hiện khung mã xác thực"
 
-    captcha_img = page.locator('img[src*="captcha"], canvas').first
-    if await captcha_img.count() == 0:
-        captcha_img = page.locator("img").nth(1)
-
-    # BƯỚC 4: giải captcha -> bấm XÁC THỰC
+    # BƯỚC 4: đọc captcha -> nhập -> Xác thực. Sai thì Làm mới ảnh rồi đọc lại.
+    last_notice = ""
     for _ in range(max_captcha_retry):
-        img_bytes = await captcha_img.screenshot()
+        if not await _captcha_modal_visible(captcha_input):
+            return "FAIL", last_notice or (await get_page_notice(page)) or "Khung mã xác thực đã đóng"
+
+        img_bytes = await _captcha_image_bytes(page, captcha_input)
         captcha_text = await doc_captcha(img_bytes)
         if not captcha_text:
-            await refresh_captcha_image(page, captcha_img, captcha_input)
+            await refresh_captcha_image(page, captcha_input)
             continue
 
         await captcha_input.first.fill(captcha_text)
         if not await click_text_button(page, r"xác thực", below=captcha_input.first):
             return "FAIL", "Không tìm thấy nút Xác thực trên web"
-        await page.wait_for_timeout(1500)
 
-        notice = await get_page_notice(page)
+        outcome, notice = await _wait_after_verify(page, captcha_input)
         low = notice.lower()
+        if outcome == "result":
+            if "thành công" in low and "thất bại" not in low:
+                return "SUCCESS", notice
+            if not ("captcha" in low or "mã xác thực" in low):
+                # Popup kết quả của web (vd: Nhận Code Thất Bại! Mã CODE không đúng...) -> báo nguyên văn cho admin
+                return "FAIL", notice or "Không có phản hồi từ web"
 
-        if "thành công" in low and "thất bại" not in low:
-            return "SUCCESS", notice
-        if "captcha" in low or "mã xác thực" in low:
-            await refresh_captcha_image(page, captcha_img, captcha_input)
-            continue
-        return "FAIL", notice or "Không có phản hồi từ web"
+        last_notice = notice
+        await refresh_captcha_image(page, captcha_input)
 
-    return "FAIL", (await get_page_notice(page)) or f"Giải captcha sai sau {max_captcha_retry} lần"
+    return "FAIL", f"Nhập mã xác thực sai {max_captcha_retry} lần liên tiếp, web vẫn bắt nhập lại"
 
 
 async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, ok: bool, note: str):
@@ -1897,6 +2117,8 @@ async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, 
 
 async def _run_codes_on_page(page, codes: list[str], game_username: str, owner_id: int) -> str | None:
     for code in codes:
+        if is_dead(code):
+            continue
         try:
             status, note = await thu_mot_code(page, code, game_username)
         except Exception as ex:
@@ -1912,7 +2134,9 @@ async def _run_codes_on_page(page, codes: list[str], game_username: str, owner_i
                 status, note = "FAIL", "Lỗi thao tác trên trang web (không đọc được phản hồi)"
 
         ok = status == "SUCCESS"
-        await report_attempt_to_admin(code, game_username, owner_id, ok, note)
+        if not ok and DEAD_CODE_RX.search(note or ""):
+            mark_dead(code)  # web báo code sai/hết hạn -> các tài khoản khác khỏi thử lại
+        fire(report_attempt_to_admin(code, game_username, owner_id, ok, note))  # gửi báo cáo ở nền
         if ok:
             return code
     return None
@@ -1924,7 +2148,7 @@ async def chay_nhap_code_cho_tai_khoan(codes: list[str], game_username: str, own
         try:
             return await _run_codes_on_page(page, codes, game_username, owner_id)
         finally:
-            await return_warm_page(page, from_pool)
+            fire(return_warm_page(page, from_pool))  # nạp lại tab ở nền, không chặn kết quả
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -1935,67 +2159,87 @@ async def chay_nhap_code_cho_tai_khoan(codes: list[str], game_username: str, own
             await browser.close()
 
 
+async def _process_account(acc, idx: int, codes: list[str], sem: asyncio.Semaphore):
+    """Nhập code cho 1 tài khoản: xoay vòng điểm bắt đầu để các tài khoản không đụng cùng 1 code."""
+    record_id = acc["id"]
+    owner_id = acc["user_id"]
+    game_user = clean_text(acc["game_username"])
+    lock = _account_locks.setdefault(record_id, asyncio.Lock())
+
+    async with lock:  # tránh 2 đợt code cùng lúc nhập cho cùng 1 tài khoản
+        async with db_pool.acquire() as conn:
+            status = await conn.fetchval("SELECT status FROM hunt_accounts WHERE id = $1", record_id)
+        if status != "active":
+            return
+
+        start = idx % len(codes)
+        rotated = codes[start:] + codes[:start]
+        async with sem:
+            try:
+                won_code = await chay_nhap_code_cho_tai_khoan(rotated, game_user, owner_id)
+            except Exception as ex:
+                print(f"Lỗi nhập code cho {game_user}: {ex}")
+                fire(bot.send_message(
+                    ADMIN_ID,
+                    f"{e('no')} <b>LỖI HỆ THỐNG</b> khi nhập code cho <code>{escape(game_user)}</code>:\n"
+                    f"<code>{escape(clean_text(str(ex))[:250])}</code>",
+                ))
+                return
+
+        if won_code:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE hunt_accounts SET status = 'done' WHERE id = $1 AND status = 'active'",
+                    record_id,
+                )
+            if owner_id != ADMIN_ID:
+                fire(bot.send_message(
+                    owner_id,
+                    f"{e('fire')} <b>NHẬP CODE THÀNH CÔNG!</b> {e('top')}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"{e('pc')} Tài khoản: <code>{escape(game_user)}</code>\n"
+                    f"{e('new')} Mã code: <code>{escape(won_code)}</code>",
+                ))
+        else:
+            fire(bot.send_message(
+                owner_id,
+                f"{e('soon')} Đợt code hiện tại chưa khớp cho <code>{escape(game_user)}</code>.\n"
+                f"{e('reload')} Hệ thống tiếp tục giữ tài khoản ở trạng thái "
+                f"<b>đang chờ nhập code</b> cho đợt code tiếp theo.",
+            ))
+
+
 async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
-    """Gửi bộ code vừa quét được (từ tin nhắn hoặc video) vào tất cả tài khoản đang chờ."""
+    """Có code mới là nhập NGAY cho tất cả tài khoản đang chờ, chạy song song trên các tab mở sẵn."""
     cleaned_codes = [clean_text(c) for c in codes if clean_text(c)]
     cleaned_codes = list(dict.fromkeys(cleaned_codes))
     if not cleaned_codes:
         return
 
-    try:
-        code_list_str = ", ".join(f"<code>{escape(c)}</code>" for c in cleaned_codes)
-        await bot.send_message(
-            ADMIN_ID,
-            f"{e('fast')} <b>QUÉT ĐƯỢC CODE MỚI ({escape(clean_text(source_label))})</b>\n"
-            f"{SEP}\n"
-            f"{e('new')} Danh sách ({len(cleaned_codes)} mã): {code_list_str}",
-        )
-    except Exception:
-        pass
+    code_list_str = ", ".join(f"<code>{escape(c)}</code>" for c in cleaned_codes)
+    fire(bot.send_message(
+        ADMIN_ID,
+        f"{e('fast')} <b>QUÉT ĐƯỢC CODE MỚI ({escape(clean_text(source_label))})</b>\n"
+        f"{SEP}\n"
+        f"{e('new')} Danh sách ({len(cleaned_codes)} mã): {code_list_str}",
+    ))
+
+    live_codes = [c for c in cleaned_codes if not is_dead(c)]
+    if not live_codes:
+        return
 
     async with db_pool.acquire() as conn:
         accounts = await conn.fetch(
-            "SELECT id, user_id, game_username FROM hunt_accounts WHERE status = 'active'"
+            "SELECT id, user_id, game_username FROM hunt_accounts WHERE status = 'active' ORDER BY id"
         )
+    if not accounts:
+        return
 
-    for acc in accounts:
-        record_id = acc["id"]
-        owner_id = acc["user_id"]
-        game_user = clean_text(acc["game_username"])
-
-        try:
-            won_code = await chay_nhap_code_cho_tai_khoan(cleaned_codes, game_user, owner_id)
-            if won_code:
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE hunt_accounts SET status = 'done' WHERE id = $1 AND status = 'active'",
-                        record_id,
-                    )
-                msg = (
-                    f"{e('fire')} <b>NHẬP CODE THÀNH CÔNG!</b> {e('top')}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"{e('pc')} Tài khoản: <code>{escape(game_user)}</code>\n"
-                    f"{e('new')} Mã code: <code>{escape(won_code)}</code>"
-                )
-                if owner_id != ADMIN_ID:
-                    await bot.send_message(owner_id, msg)
-            else:
-                await bot.send_message(
-                    owner_id,
-                    f"{e('soon')} Đợt code hiện tại chưa khớp cho <code>{escape(game_user)}</code>.\n"
-                    f"{e('reload')} Hệ thống tiếp tục giữ tài khoản ở trạng thái "
-                    f"<b>đang chờ nhập code</b> cho đợt code tiếp theo.",
-                )
-        except Exception as ex:
-            print(f"Lỗi nhập code cho {game_user}: {ex}")
-            try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"{e('no')} <b>LỖI HỆ THỐNG</b> khi nhập code cho <code>{escape(game_user)}</code>:\n"
-                    f"<code>{escape(clean_text(str(ex))[:250])}</code>",
-                )
-            except Exception:
-                pass
+    sem = asyncio.Semaphore(max(1, WARM_TAB_COUNT))
+    await asyncio.gather(
+        *(_process_account(acc, i, live_codes, sem) for i, acc in enumerate(accounts)),
+        return_exceptions=True,
+    )
 
 
 # =====================================================================
@@ -2018,7 +2262,7 @@ async def start_scanner(session_str: str):
             group_name = getattr(chat, "username", None) or "video_group"
             codes = await extract_codes_from_video_message(event.message)
             if codes:
-                await dispatch_codes_to_accounts(codes, f"Video {group_name}")
+                fire(dispatch_codes_to_accounts(codes, f"Video {group_name}"))
         except Exception as ex:
             print(f"Lỗi quét video: {ex}")
 
@@ -2032,7 +2276,7 @@ async def start_scanner(session_str: str):
             group_name = getattr(chat, "username", None) or "text_group"
             codes = extract_clean_codes(event.raw_text)
             if codes:
-                await dispatch_codes_to_accounts(codes, f"Tin nhắn {group_name}")
+                fire(dispatch_codes_to_accounts(codes, f"Tin nhắn {group_name}"))
         except Exception as ex:
             print(f"Lỗi quét tin nhắn: {ex}")
 
