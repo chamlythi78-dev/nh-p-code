@@ -182,6 +182,7 @@ BTN_HISTORY = "Lịch Sử"
 BTN_ORDERS = "Đơn Hàng"
 BTN_SUPPORT = "Nhóm Hỗ Trợ"
 MENU_TEXTS = (BTN_CODE, BTN_ACCOUNT, BTN_DEPOSIT, BTN_HISTORY, BTN_ORDERS, BTN_SUPPORT)
+EXIT_WORDS = {"thoát", "thoat", "hủy", "huy", "cancel", "exit", "quit", "đóng", "dong"}
 
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
@@ -205,12 +206,49 @@ def clean_text(raw: str | None) -> str:
     return s
 
 
+def is_exit_text(raw: str | None) -> bool:
+    return clean_text(raw).lower() in EXIT_WORDS
+
+
+def is_menu_or_command_text(raw: str | None) -> bool:
+    s = clean_text(raw)
+    return s in MENU_TEXTS or s.startswith("/")
+
+
 def now_str() -> str:
     return datetime.now(VN_TZ).strftime("%H:%M:%S %d/%m/%Y")
 
 
 def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(VN_TZ).strftime("%H:%M %d/%m/%Y")
+
+
+async def _cleanup_temp_login():
+    global temp_login_client, login_phone_code_hash
+    login_phone_code_hash = None
+    if temp_login_client:
+        try:
+            if temp_login_client.is_connected():
+                await temp_login_client.disconnect()
+        except Exception:
+            pass
+        temp_login_client = None
+
+
+async def exit_state_to_home(message: types.Message, state: FSMContext, reason: str = "Đã thoát thao tác."):
+    await state.clear()
+    await _cleanup_temp_login()
+    bal = await get_user_balance(message.from_user.id)
+    await message.answer(f"{e('ok')} {escape(reason)}\n\n" + home_text(bal), reply_markup=main_kb)
+
+
+@dp.callback_query(F.data == "state:exit")
+async def cb_exit_state(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _cleanup_temp_login()
+    bal = await get_user_balance(call.from_user.id)
+    await call.message.answer(f"{e('ok')} Đã thoát thao tác hiện tại.\n\n" + home_text(bal), reply_markup=main_kb)
+    await call.answer("Đã thoát")
 
 
 # =====================================================================
@@ -398,7 +436,7 @@ async def add_tx(conn, user_id: int, amount: int, tx_type: str, note: str = ""):
 
 
 # =====================================================================
-# ADMIN: ĐĂNG NHẬP USERBOT (HỖ TRỢ GỬI LẠI / SMS OTP)
+# ADMIN: ĐĂNG NHẬP USERBOT (HỖ TRỢ GỬI LẠI / SMS OTP + NÚT THOÁT)
 # =====================================================================
 async def _request_login_code(message: types.Message, state: FSMContext, force_sms: bool = False):
     global temp_login_client, login_phone_code_hash
@@ -417,24 +455,28 @@ async def _request_login_code(message: types.Message, state: FSMContext, force_s
         delivery_type = type(getattr(sent, "type", None)).__name__ if getattr(sent, "type", None) else "app/sms"
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [inline_btn("Gửi lại qua SMS", "reload", "login:sms"), inline_btn("Gửi lại mã mới", "mail", "login:resend")]
+            [inline_btn("Gửi lại qua SMS", "reload", "login:sms"), inline_btn("Gửi lại mã mới", "mail", "login:resend")],
+            [inline_btn("Thoát", "no", "state:exit")],
         ])
         await message.answer(
             f"{e('mail')} Đã yêu cầu gửi mã OTP ({escape(delivery_type)}) tới SĐT <code>{escape(PHONE_NUMBER)}</code>.\n"
             f"{e('lock')} Hãy nhập mã OTP vào đây (có thể thêm chữ <code>a</code> phía trước, ví dụ: <code>a12345</code>).\n"
-            f"{e('bulb')} Nếu không thấy OTP trong app Telegram, bấm <b>Gửi lại qua SMS</b> hoặc kiểm tra mục <b>Telegram</b> / tin nhắn hệ thống.",
+            f"{e('bulb')} Muốn huỷ và dùng chức năng khác, bấm <b>Thoát</b> hoặc gõ <code>thoát</code>.",
             reply_markup=kb,
         )
         await state.set_state(BotStates.waiting_for_otp)
     except FloodWaitError as fw:
+        await state.clear()
         await message.answer(
             f"{e('warn')} Telegram đang giới hạn gửi mã (FloodWait): vui lòng đợi <b>{fw.seconds} giây</b> rồi thử lại <code>/login</code>."
         )
     except PhoneNumberInvalidError:
+        await state.clear()
         await message.answer(
             f"{e('no')} Số điện thoại <code>{escape(PHONE_NUMBER)}</code> không hợp lệ trên Telegram. Kiểm tra biến <code>PHONE_NUMBER</code>."
         )
     except Exception as ex:
+        await state.clear()
         await message.answer(f"{e('no')} Lỗi gửi OTP: <code>{escape(clean_text(str(ex)))}</code>")
 
 
@@ -461,13 +503,25 @@ async def admin_login_otp(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     raw_text = (message.text or "").strip()
+    if is_exit_text(raw_text):
+        await exit_state_to_home(message, state, "Đã thoát đăng nhập OTP.")
+        return
     if raw_text.startswith("/login"):
         await _request_login_code(message, state, force_sms=False)
+        return
+    if is_menu_or_command_text(raw_text):
+        await state.clear()
+        await _cleanup_temp_login()
+        await dp.feed_update(bot, types.Update(update_id=message.message_id, message=message))
         return
 
     otp = re.sub(r"\D", "", raw_text)
     if not otp:
-        await message.answer(f"{e('no')} Mã OTP không hợp lệ, nhập lại (ví dụ <code>12345</code> hoặc <code>a12345</code>):")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[inline_btn("Thoát", "no", "state:exit")]])
+        await message.answer(
+            f"{e('no')} Mã OTP không hợp lệ, nhập lại (ví dụ <code>12345</code> hoặc <code>a12345</code>) hoặc bấm <b>Thoát</b>:",
+            reply_markup=kb,
+        )
         return
     try:
         if not temp_login_client or not temp_login_client.is_connected():
@@ -482,21 +536,27 @@ async def admin_login_otp(message: types.Message, state: FSMContext):
         session_str = temp_login_client.session.save()
         await save_session(session_str)
         await state.clear()
+        await _cleanup_temp_login()
         await message.answer(
             f"{e('ok')} Đăng nhập nick quét thành công và đã lưu vào PostgreSQL!\n"
             f"{e('reload')} Đang khởi động bộ quét..."
         )
         asyncio.create_task(start_scanner(session_str))
     except SessionPasswordNeededError:
-        await message.answer(f"{e('lock')} Nick có bật mật khẩu 2 bước (2FA). Vui lòng nhập mật khẩu:")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[inline_btn("Thoát", "no", "state:exit")]])
+        await message.answer(
+            f"{e('lock')} Nick có bật mật khẩu 2 bước (2FA). Vui lòng nhập mật khẩu hoặc bấm <b>Thoát</b>:",
+            reply_markup=kb,
+        )
         await state.set_state(BotStates.waiting_for_2fa)
     except Exception as ex:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [inline_btn("Gửi lại qua SMS", "reload", "login:sms"), inline_btn("Gửi lại mã mới", "mail", "login:resend")]
+            [inline_btn("Gửi lại qua SMS", "reload", "login:sms"), inline_btn("Gửi lại mã mới", "mail", "login:resend")],
+            [inline_btn("Thoát", "no", "state:exit")],
         ])
         await message.answer(
             f"{e('no')} Lỗi xác nhận OTP: <code>{escape(clean_text(str(ex)))}</code>\n"
-            f"Bạn có thể nhập lại mã OTP hoặc bấm nút gửi lại bên dưới.",
+            f"Bạn có thể nhập lại mã OTP, bấm gửi lại hoặc bấm <b>Thoát</b>.",
             reply_markup=kb,
         )
 
@@ -506,18 +566,30 @@ async def admin_login_2fa(message: types.Message, state: FSMContext):
     global temp_login_client
     if message.from_user.id != ADMIN_ID:
         return
+    raw_text = (message.text or "").strip()
+    if is_exit_text(raw_text):
+        await exit_state_to_home(message, state, "Đã thoát nhập mật khẩu 2FA.")
+        return
+    if is_menu_or_command_text(raw_text):
+        await state.clear()
+        await _cleanup_temp_login()
+        await dp.feed_update(bot, types.Update(update_id=message.message_id, message=message))
+        return
+
     try:
-        await temp_login_client.sign_in(password=(message.text or "").strip())
+        await temp_login_client.sign_in(password=raw_text)
         session_str = temp_login_client.session.save()
         await save_session(session_str)
         await state.clear()
+        await _cleanup_temp_login()
         await message.answer(f"{e('ok')} Đăng nhập 2FA thành công!\n{e('reload')} Đang khởi động bộ quét...")
         asyncio.create_task(start_scanner(session_str))
     except Exception as ex:
+        await state.clear()
+        await _cleanup_temp_login()
         await message.answer(
             f"{e('no')} Sai mật khẩu 2FA: <code>{escape(clean_text(str(ex)))}</code>\nGõ <code>/login</code> để thử lại."
         )
-        await state.clear()
 
 
 # =====================================================================
@@ -561,6 +633,7 @@ async def cb_noop(call: types.CallbackQuery):
 @dp.callback_query(F.data == "home")
 async def cb_home(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    await _cleanup_temp_login()
     bal = await get_user_balance(call.from_user.id)
     await call.message.answer(home_text(bal), reply_markup=main_kb)
     await call.answer()
@@ -572,6 +645,7 @@ async def cb_home(call: types.CallbackQuery, state: FSMContext):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
+    await _cleanup_temp_login()
     bal = await get_user_balance(message.from_user.id)
     await message.answer(home_text(bal), reply_markup=main_kb)
 
@@ -604,6 +678,7 @@ async def build_account(user: types.User):
 @dp.message(F.text == BTN_ACCOUNT)
 async def menu_account(message: types.Message, state: FSMContext):
     await state.clear()
+    await _cleanup_temp_login()
     text, kb = await build_account(message.from_user)
     await message.answer(text, reply_markup=kb)
 
@@ -640,6 +715,7 @@ def deposit_menu_content(bal: int):
 @dp.message(F.text == BTN_DEPOSIT)
 async def menu_deposit(message: types.Message, state: FSMContext):
     await state.clear()
+    await _cleanup_temp_login()
     bal = await get_user_balance(message.from_user.id)
     text, kb = deposit_menu_content(bal)
     await message.answer(text, reply_markup=kb)
@@ -774,7 +850,9 @@ async def cb_deposit(call: types.CallbackQuery, state: FSMContext):
             f"{SEP}\n"
             f"{e('money')} Tối thiểu <b>{MIN_DEPOSIT:,}đ</b>, tối đa <b>{MAX_DEPOSIT:,}đ</b>.\n"
             f"{e('mail')} Gửi số tiền muốn nạp, ví dụ: <code>75000</code> hoặc <code>75k</code>",
-            InlineKeyboardMarkup(inline_keyboard=[[inline_btn("Quay lại", "reload", "dep:menu")]]),
+            InlineKeyboardMarkup(inline_keyboard=[
+                [inline_btn("Quay lại", "reload", "dep:menu"), inline_btn("Thoát", "no", "state:exit")]
+            ]),
         )
         await call.answer()
         return
@@ -826,12 +904,18 @@ async def cb_deposit(call: types.CallbackQuery, state: FSMContext):
 @dp.message(BotStates.waiting_for_amount)
 async def deposit_custom_amount(message: types.Message, state: FSMContext):
     raw = message.text or ""
-    if raw.strip().startswith("/"):
-        await message.answer(f"{e('no')} Số tiền không hợp lệ, nhập lại (ví dụ <code>75000</code>):")
+    if is_exit_text(raw):
+        await exit_state_to_home(message, state, "Đã thoát nhập số tiền.")
+        return
+    if is_menu_or_command_text(raw):
+        await state.clear()
+        await dp.feed_update(bot, types.Update(update_id=message.message_id, message=message))
         return
     amount = parse_amount(raw)
     if amount is None:
-        await message.answer(f"{e('no')} Số tiền không hợp lệ, nhập lại (ví dụ <code>75000</code> hoặc <code>75k</code>):")
+        await message.answer(
+            f"{e('no')} Số tiền không hợp lệ, nhập lại (ví dụ <code>75000</code> hoặc <code>75k</code>) hoặc gõ <code>thoát</code>:"
+        )
         return
     if amount < MIN_DEPOSIT:
         await message.answer(f"{e('no')} Nạp tối thiểu <b>{MIN_DEPOSIT:,}đ</b>, nhập lại:")
@@ -885,6 +969,7 @@ async def build_history(uid: int, page: int):
 @dp.message(F.text == BTN_HISTORY)
 async def menu_history(message: types.Message, state: FSMContext):
     await state.clear()
+    await _cleanup_temp_login()
     text, kb = await build_history(message.from_user.id, 0)
     await message.answer(text, reply_markup=kb)
 
@@ -938,6 +1023,7 @@ async def build_orders(uid: int, page: int):
 @dp.message(F.text == BTN_ORDERS)
 async def menu_orders(message: types.Message, state: FSMContext):
     await state.clear()
+    await _cleanup_temp_login()
     text, kb = await build_orders(message.from_user.id, 0)
     await message.answer(text, reply_markup=kb)
 
@@ -953,6 +1039,7 @@ async def cb_orders(call: types.CallbackQuery):
 @dp.message(F.text == BTN_SUPPORT)
 async def menu_support(message: types.Message, state: FSMContext):
     await state.clear()
+    await _cleanup_temp_login()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [url_btn("Nhóm Hỗ Trợ", "mega", f"https://t.me/{SUPPORT_GROUP}")],
         [url_btn("Admin Hỗ Trợ", "shield", f"https://t.me/{SUPPORT_ADMIN}")],
@@ -986,6 +1073,7 @@ def game_list_content(bal: int):
 @dp.message(F.text == BTN_CODE)
 async def menu_code(message: types.Message, state: FSMContext):
     await state.clear()
+    await _cleanup_temp_login()
     bal = await get_user_balance(message.from_user.id)
     text, kb = game_list_content(bal)
     await message.answer(text, reply_markup=kb)
@@ -1065,6 +1153,7 @@ async def buy_start(call: types.CallbackQuery, state: FSMContext):
         f"{e('mail')} Gửi <b>tên tài khoản</b> cần nhập code.\n"
         f"{e('plus')} Muốn mua nhiều nick, mỗi nick <b>một dòng</b> (tối đa {MAX_BATCH}), ví dụ:\n"
         f"<code>bolatienphong\nnoapq1983</code>",
+        InlineKeyboardMarkup(inline_keyboard=[[inline_btn("Thoát", "no", "state:exit")]]),
     )
     await call.answer()
 
@@ -1086,13 +1175,17 @@ def parse_usernames(raw: str) -> list[str]:
 @dp.message(BotStates.waiting_for_username)
 async def buy_code_preview(message: types.Message, state: FSMContext):
     raw = message.text or ""
-    if raw.strip() in MENU_TEXTS or raw.strip().startswith("/"):
-        await message.answer(f"{e('no')} Tên tài khoản không hợp lệ, nhập lại:")
+    if is_exit_text(raw):
+        await exit_state_to_home(message, state, "Đã thoát nhập tên tài khoản.")
+        return
+    if is_menu_or_command_text(raw):
+        await state.clear()
+        await dp.feed_update(bot, types.Update(update_id=message.message_id, message=message))
         return
 
     names = parse_usernames(raw)
     if not names:
-        await message.answer(f"{e('no')} Tên tài khoản không được để trống, nhập lại:")
+        await message.answer(f"{e('no')} Tên tài khoản không được để trống, nhập lại hoặc gõ <code>thoát</code>:")
         return
     if len(names) > MAX_BATCH:
         await message.answer(f"{e('no')} Mỗi lần chỉ mua tối đa <b>{MAX_BATCH}</b> tài khoản, nhập lại:")
@@ -1317,10 +1410,19 @@ async def expire_orders_loop():
 # =====================================================================
 # ADMIN
 # =====================================================================
-@dp.message(Command("checkweb"))
-async def admin_check_web(message: types.Message):
+@dp.message(Command("thoat", "huythao", "cancel"))
+async def admin_exit_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    await exit_state_to_home(message, state, "Đã thoát trạng thái đang chờ.")
+
+
+@dp.message(Command("checkweb"))
+async def admin_check_web(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await _cleanup_temp_login()
     status_msg = await message.answer(f"{e('reload')} Đang kiểm tra truy cập <code>{escape(TARGET_URL)}</code>...")
     t0 = time.perf_counter()
     page = None
@@ -1383,9 +1485,11 @@ async def admin_check_web(message: types.Message):
 
 
 @dp.message(Command("nap"))
-async def admin_add_money(message: types.Message):
+async def admin_add_money(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    await state.clear()
+    await _cleanup_temp_login()
     try:
         _, target_id, amount = message.text.split()
         target_id, amount = int(target_id), int(amount)
@@ -1410,9 +1514,11 @@ async def admin_add_money(message: types.Message):
 
 
 @dp.message(Command("hoan"))
-async def admin_refund_money(message: types.Message):
+async def admin_refund_money(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    await state.clear()
+    await _cleanup_temp_login()
     try:
         _, target_id, amount = message.text.split()
         target_id, amount = int(target_id), int(amount)
@@ -1428,9 +1534,11 @@ async def admin_refund_money(message: types.Message):
 
 
 @dp.message(Command("tru"))
-async def admin_sub_money(message: types.Message):
+async def admin_sub_money(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    await state.clear()
+    await _cleanup_temp_login()
     try:
         _, target_id, amount = message.text.split()
         target_id, amount = int(target_id), int(amount)
@@ -1448,9 +1556,11 @@ async def admin_sub_money(message: types.Message):
 
 
 @dp.message(Command("huy"))
-async def admin_cancel_order(message: types.Message):
+async def admin_cancel_order(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    await state.clear()
+    await _cleanup_temp_login()
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.answer(f"{e('no')} Cú pháp: <code>/huy &lt;ten_tai_khoan&gt;</code>")
@@ -1482,9 +1592,11 @@ async def admin_cancel_order(message: types.Message):
 
 
 @dp.message(Command("thongke"))
-async def admin_stats(message: types.Message):
+async def admin_stats(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    await state.clear()
+    await _cleanup_temp_login()
     async with db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         active_accs = await conn.fetchval("SELECT COUNT(*) FROM hunt_accounts WHERE status = 'active'")
