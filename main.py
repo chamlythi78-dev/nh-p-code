@@ -59,7 +59,7 @@ CODE_PRICE = 10000
 MAX_BATCH = 30
 ORDER_TIMEOUT_HOURS = 72
 PAGE_SIZE = 8
-WARM_TAB_COUNT = int(os.getenv("WARM_TAB_COUNT", "4"))
+WARM_TAB_COUNT = int(os.getenv("WARM_TAB_COUNT", "6"))
 
 # Hỗ trợ
 SUPPORT_GROUP = "khututricvx"
@@ -168,12 +168,20 @@ _tab_queue: asyncio.Queue | None = None
 _pool_lock = asyncio.Lock()
 _in_use = 0  # số tab của pool đang được mượn
 _tab_refreshed: dict = {}  # tab -> thời điểm nạp lại trang gần nhất
-_account_locks: dict[int, asyncio.Lock] = {}  # mỗi tài khoản chỉ nhập 1 luồng tại một thời điểm
+_tab_sem: asyncio.Semaphore | None = None  # giới hạn số tab chạy đồng thời trên toàn bot
+_inflight_codes: set[str] = set()          # code đang có tab nhập, tránh 2 tab nhập trùng 1 code
 _dead_codes: dict[str, float] = {}  # code web báo sai/hết hạn -> thời điểm, bỏ qua cho mọi tài khoản
 _fire_tasks: set = set()
 TAB_MAX_AGE = 240  # tab đứng yên quá số giây này sẽ được nạp lại để luôn "tươi"
 DEAD_CODE_TTL = 120
 DEAD_CODE_RX = re.compile(r"mã code không đúng|code .*hết (lượt|hạn)|code .*đã (được )?sử dụng", re.I)
+
+
+def _get_tab_sem() -> asyncio.Semaphore:
+    global _tab_sem
+    if _tab_sem is None:
+        _tab_sem = asyncio.Semaphore(max(1, WARM_TAB_COUNT))
+    return _tab_sem
 
 
 def fire(coro):
@@ -1415,7 +1423,6 @@ async def order_confirm(call: types.CallbackQuery, state: FSMContext):
         )
     else:
         valid_list = "\n".join(f"• <code>{escape(n)}</code>" for n in r["valid"])
-        fire(try_recent_codes_for_new_accounts(call.from_user.id, r["valid"]))
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [inline_btn("Xem Đơn Hàng", "gift", "ord:0"), inline_btn("Menu Chính", "up", "home")],
         ])
@@ -2116,10 +2123,6 @@ async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, 
         print(f"Không gửi được báo cáo cho admin: {ex}")
 
 
-RECENT_CODE_TTL = 900  # code quét được trong 15 phút gần nhất sẽ thử luôn cho tài khoản MỚI đăng ký
-_recent_codes: dict[str, float] = {}
-
-
 async def _attempt_code(code: str, game_username: str, owner_id: int) -> tuple[str, str]:
     """
     Một lần thử = một tab riêng. Thử xong là nạp lại tab ở nền để trống chỗ cho lượt sau.
@@ -2152,112 +2155,133 @@ async def _attempt_code(code: str, game_username: str, owner_id: int) -> tuple[s
         fire(return_warm_page(page, from_pool))  # nạp lại tab ở nền cho đợt sau
 
 
-async def chay_nhap_code_cho_tai_khoan(codes: list[str], game_username: str, owner_id: int) -> str | None:
-    """
-    Thử lần lượt từng code cho 1 tài khoản. Mỗi code dùng 1 tab mới lấy từ pool:
-    tab nào không thành công thì bỏ, lập tức sang tab khác nhập code kế tiếp (tab cũ tự nạp lại ở nền).
-    """
-    for code in codes:
-        if is_dead(code):
-            continue
-        status, note = "ERROR", ""
-        for attempt in range(2):
-            status, note = await _attempt_code(code, game_username, owner_id)
-            if status == "ERROR" and attempt == 0:
-                continue  # lỗi do tab -> đổi sang tab khác thử lại đúng code này 1 lần
-            break
-
-        ok = status == "SUCCESS"
-        if not ok and DEAD_CODE_RX.search(note or ""):
-            mark_dead(code)  # web báo code sai/hết hạn -> các tài khoản khác khỏi thử lại
-        fire(report_attempt_to_admin(code, game_username, owner_id, ok, note))
-        if ok:
-            return code
-    return None
+# =====================================================================
+# CHIA CODE CHO TÀI KHOẢN VÀ NHẬP SONG SONG NHIỀU TAB
+# =====================================================================
+async def _account_still_active(record_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        st = await conn.fetchval("SELECT status FROM hunt_accounts WHERE id = $1", record_id)
+    return st == "active"
 
 
-async def _process_account(acc, idx: int, codes: list[str], sem: asyncio.Semaphore):
-    """Nhập code cho 1 tài khoản: xoay vòng điểm bắt đầu để các tài khoản không đụng cùng 1 code."""
+async def _mark_account_done(acc, code: str):
     record_id = acc["id"]
     owner_id = acc["user_id"]
     game_user = clean_text(acc["game_username"])
-    lock = _account_locks.setdefault(record_id, asyncio.Lock())
-
-    async with lock:  # tránh 2 đợt code cùng lúc nhập cho cùng 1 tài khoản
-        async with db_pool.acquire() as conn:
-            status = await conn.fetchval("SELECT status FROM hunt_accounts WHERE id = $1", record_id)
-        if status != "active":
-            return
-
-        start = idx % len(codes)
-        rotated = codes[start:] + codes[:start]
-        async with sem:
-            try:
-                won_code = await chay_nhap_code_cho_tai_khoan(rotated, game_user, owner_id)
-            except Exception as ex:
-                print(f"Lỗi nhập code cho {game_user}: {ex}")
-                fire(bot.send_message(
-                    ADMIN_ID,
-                    f"{e('no')} <b>LỖI HỆ THỐNG</b> khi nhập code cho <code>{escape(game_user)}</code>:\n"
-                    f"<code>{escape(clean_text(str(ex))[:250])}</code>",
-                ))
-                return
-
-        if won_code:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE hunt_accounts SET status = 'done' WHERE id = $1 AND status = 'active'",
-                    record_id,
-                )
-            if owner_id != ADMIN_ID:
-                fire(bot.send_message(
-                    owner_id,
-                    f"{e('fire')} <b>NHẬP CODE THÀNH CÔNG!</b> {e('top')}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"{e('pc')} Tài khoản: <code>{escape(game_user)}</code>\n"
-                    f"{e('new')} Mã code: <code>{escape(won_code)}</code>",
-                ))
-        else:
-            fire(bot.send_message(
-                owner_id,
-                f"{e('soon')} Đợt code hiện tại chưa khớp cho <code>{escape(game_user)}</code>.\n"
-                f"{e('reload')} Hệ thống tiếp tục giữ tài khoản ở trạng thái "
-                f"<b>đang chờ nhập code</b> cho đợt code tiếp theo.",
-            ))
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE hunt_accounts SET status = 'done' WHERE id = $1 AND status = 'active'", record_id
+        )
+    if owner_id != ADMIN_ID:
+        fire(bot.send_message(
+            owner_id,
+            f"{e('fire')} <b>NHẬP CODE THÀNH CÔNG!</b> {e('top')}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{e('pc')} Tài khoản: <code>{escape(game_user)}</code>\n"
+            f"{e('new')} Mã code: <code>{escape(code)}</code>",
+        ))
 
 
 async def _run_accounts(accounts, codes: list[str]):
-    """Chạy song song các tài khoản trên các tab mở sẵn; lỗi của từng tài khoản đều báo admin (không nuốt)."""
-    sem = asyncio.Semaphore(max(1, WARM_TAB_COUNT))
-    results = await asyncio.gather(
-        *(_process_account(acc, i, codes, sem) for i, acc in enumerate(accounts)),
-        return_exceptions=True,
-    )
-    for acc, res in zip(accounts, results):
-        if isinstance(res, BaseException):
-            print(f"Lỗi xử lý tài khoản {acc['game_username']}: {type(res).__name__}: {res}")
-            fire(bot.send_message(
-                ADMIN_ID,
-                f"{e('no')} <b>LỖI HỆ THỐNG</b> khi xử lý <code>{escape(clean_text(acc['game_username']))}</code>:\n"
-                f"<code>{escape(clean_text(f'{type(res).__name__}: {res}')[:250])}</code>",
-            ))
+    """
+    Chia code cho tài khoản và chạy song song trên nhiều tab:
+      - Mỗi lượt lấy 1 code chưa ai nhập, giao cho tài khoản đang được giao ít nhất (chia đều).
+      - Tab nào xong thì nhận ngay cặp (code, tài khoản) kế tiếp.
+      - Tài khoản thành công -> dừng, code còn lại dồn sang tài khoản chưa thành công.
+      - Code web báo sai/hết hạn/đã dùng -> bỏ, không thử tiếp ở tài khoản khác.
+      - Code thất bại vì lý do riêng của tài khoản -> được thử sang tài khoản khác.
+    """
+    accs = {a["id"]: a for a in accounts}
+    done: set[int] = set()
+    dead: set[str] = set()                 # code đã dùng thành công hoặc bị web báo chết
+    tried: set[tuple[int, str]] = set()    # cặp (tài khoản, code) đã thử
+    assigned: dict[int, int] = {aid: 0 for aid in accs}
+    active = [0]                           # số tab đang chạy trong đợt này
+
+    def pick():
+        for code in codes:
+            if code in dead or code in _inflight_codes or is_dead(code):
+                continue
+            cands = [aid for aid in accs if aid not in done and (aid, code) not in tried]
+            if not cands:
+                continue
+            aid = min(cands, key=lambda a: (assigned[a], a))  # tài khoản được giao ít nhất
+            _inflight_codes.add(code)
+            tried.add((aid, code))
+            assigned[aid] += 1
+            return aid, code
+        return None
+
+    async def worker():
+        while True:
+            job = pick()  # không có await bên trong nên không bị tranh chấp giữa các tab
+            if job is None:
+                if active[0] == 0:
+                    return  # không còn việc và không còn tab nào đang chạy
+                await asyncio.sleep(0.2)  # chờ tab khác xong, có thể có code được nhả ra
+                continue
+            aid, code = job
+            active[0] += 1
+            acc = accs[aid]
+            game_user = clean_text(acc["game_username"])
+            owner_id = acc["user_id"]
+            try:
+                if aid in done or not await _account_still_active(aid):
+                    done.add(aid)
+                    continue
+
+                status, note = "ERROR", ""
+                for attempt in range(2):
+                    async with _get_tab_sem():
+                        status, note = await _attempt_code(code, game_user, owner_id)
+                    if status == "ERROR" and attempt == 0:
+                        continue
+                    break
+
+                ok = status == "SUCCESS"
+                if ok:
+                    done.add(aid)
+                    dead.add(code)
+                    await _mark_account_done(acc, code)
+                elif DEAD_CODE_RX.search(note or ""):
+                    mark_dead(code)
+                    dead.add(code)
+                fire(report_attempt_to_admin(code, game_user, owner_id, ok, note))
+            except Exception as ex:
+                print(f"Lỗi nhập code {code} cho {game_user}: {type(ex).__name__}: {ex}")
+                fire(bot.send_message(
+                    ADMIN_ID,
+                    f"{e('no')} <b>LỖI HỆ THỐNG</b> khi nhập code cho <code>{escape(game_user)}</code>:\n"
+                    f"<code>{escape(clean_text(f'{type(ex).__name__}: {ex}')[:250])}</code>",
+                ))
+            finally:
+                _inflight_codes.discard(code)
+                active[0] -= 1
+
+    worker_count = max(1, min(WARM_TAB_COUNT, len(accs) * len(codes)))
+    await asyncio.gather(*(worker() for _ in range(worker_count)), return_exceptions=True)
+
+    for aid, acc in accs.items():
+        if aid in done:
+            continue
+        fire(bot.send_message(
+            acc["user_id"],
+            f"{e('soon')} Đợt code hiện tại chưa khớp cho <code>{escape(clean_text(acc['game_username']))}</code>.\n"
+            f"{e('reload')} Hệ thống tiếp tục giữ tài khoản ở trạng thái "
+            f"<b>đang chờ nhập code</b> cho đợt code tiếp theo.",
+        ))
     fire(init_browser_pool(WARM_TAB_COUNT))  # đảm bảo luôn đủ tab trống cho đợt sau
 
 
 async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
-    """Có code mới là nhập NGAY cho tất cả tài khoản đang chờ, chạy song song trên các tab mở sẵn."""
+    """Quét được code là nhập NGAY cho mọi tài khoản đang chờ, chạy song song nhiều tab."""
     cleaned_codes = [clean_text(c) for c in codes if clean_text(c)]
     cleaned_codes = list(dict.fromkeys(cleaned_codes))
     if not cleaned_codes:
         return
 
-    now = time.time()
     for c in cleaned_codes:
-        _dead_codes.pop(c, None)  # code được đăng lại -> thử lại từ đầu, không bỏ qua
-        _recent_codes[c] = now
-    for c, ts in list(_recent_codes.items()):
-        if now - ts > RECENT_CODE_TTL:
-            _recent_codes.pop(c, None)
+        _dead_codes.pop(c, None)  # code được đăng lại -> thử lại từ đầu
 
     async with db_pool.acquire() as conn:
         accounts = await conn.fetch(
@@ -2275,31 +2299,6 @@ async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
     if not accounts:
         return
     await _run_accounts(accounts, cleaned_codes)
-
-
-async def try_recent_codes_for_new_accounts(user_id: int, names: list[str]):
-    """Vừa đăng ký tài khoản: thử ngay các code quét được trong vài phút gần nhất, không chờ đợt code sau."""
-    now = time.time()
-    codes = [c for c, ts in _recent_codes.items() if now - ts <= RECENT_CODE_TTL]
-    if not codes:
-        return
-    codes.sort(key=lambda c: -_recent_codes[c])  # code mới nhất thử trước
-    async with db_pool.acquire() as conn:
-        accounts = await conn.fetch(
-            "SELECT id, user_id, game_username FROM hunt_accounts "
-            "WHERE user_id = $1 AND status = 'active' AND lower(game_username) = ANY($2::text[]) ORDER BY id",
-            user_id, [n.lower() for n in names],
-        )
-    if not accounts:
-        return
-    names_text = ", ".join(f"<code>{escape(clean_text(a['game_username']))}</code>" for a in accounts)
-    fire(bot.send_message(
-        ADMIN_ID,
-        f"{e('fast')} <b>TÀI KHOẢN MỚI ĐĂNG KÝ</b> - nhập ngay {len(codes)} mã quét gần nhất\n"
-        f"{SEP}\n"
-        f"{e('pc')} {names_text}",
-    ))
-    await _run_accounts(accounts, codes)
 
 
 # =====================================================================
