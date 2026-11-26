@@ -2038,7 +2038,47 @@ async def _wait_after_verify(page, captcha_input, timeout_ms: int = 3500) -> tup
     return "result", await get_page_notice(page)
 
 
-async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 6) -> tuple[str, str]:
+CAPTCHA_ERR_RX = re.compile(r"không tải được captcha|tải captcha|làm mới hoặc thử lại", re.I)
+MAX_ATTEMPTS_PER_CODE = 8  # chưa vượt qua bước captcha thì nhập lại code đó tối đa số lần này
+
+
+def _is_captcha_notice(low: str) -> bool:
+    return bool(CAPTCHA_ERR_RX.search(low)) or "captcha" in low or "mã xác thực" in low or "nhập đúng mã trong ảnh" in low
+
+
+def _is_code_verdict(text: str) -> bool:
+    """True khi web đã trả lời về CODE (sai/hết hạn/thành công...), không phải thông báo của khung captcha."""
+    low = (text or "").lower()
+    return bool(low) and not _is_captcha_notice(low) and any(k in low for k in RESULT_KEYWORDS)
+
+
+async def _captcha_loaded(page, captcha_input) -> bool:
+    """Ảnh captcha đã tải xong chưa (ảnh lỗi/đang tải thì naturalWidth = 0)."""
+    el = await _find_captcha_element(page, captcha_input)
+    if el is None:
+        return True  # không xác định được phần tử -> để bước chụp dự phòng xử lý
+    try:
+        return bool(await el.evaluate("e => e.tagName !== 'IMG' || (e.complete && e.naturalWidth > 0)"))
+    except Exception:
+        return True
+
+
+async def _refresh_until_loaded(page, captcha_input):
+    """Bấm Làm mới ảnh rồi chờ ảnh captcha mới tải xong."""
+    await refresh_captcha_image(page, captcha_input)
+    for _ in range(10):
+        if await _captcha_loaded(page, captcha_input):
+            return
+        await page.wait_for_timeout(300)
+
+
+async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 8) -> tuple[str, str]:
+    """
+    Trả về:
+      SUCCESS - web báo nhập code thành công
+      FAIL    - web đã trả lời về CODE (sai / hết hạn / đã dùng...) -> không cần nhập lại
+      RETRY   - chưa vượt qua được bước captcha (hoặc web chưa trả lời về code) -> nhập lại code này
+    """
     clean_code = clean_text(code)
     clean_user = clean_text(game_username)
 
@@ -2064,43 +2104,62 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
 
     # BƯỚC 2: bấm KIỂM TRA (nút nằm dưới ô tài khoản)
     if not await click_text_button(page, r"kiểm tra", below=user_input.first):
-        return "FAIL", "Không tìm thấy nút Kiểm tra trên web"
+        return "RETRY", "Không tìm thấy nút Kiểm tra trên web"
 
     # BƯỚC 3: chờ khung "Mã xác thực" (ô captcha) hiện ra
     try:
         await captcha_input.first.wait_for(state="visible", timeout=8000)
     except Exception:
-        return "FAIL", (await get_page_notice(page)) or "Bấm Kiểm tra nhưng web không hiện khung mã xác thực"
+        popup = await _popup_text(page)
+        if _is_code_verdict(popup):
+            return "FAIL", popup
+        return "RETRY", popup or "Bấm Kiểm tra nhưng web không hiện khung mã xác thực"
 
-    # BƯỚC 4: đọc captcha -> nhập -> Xác thực. Sai thì Làm mới ảnh rồi đọc lại.
+    # BƯỚC 4: đọc captcha -> nhập -> Xác thực.
+    # Captcha lỗi / không tải được / nhập sai -> bấm "Làm mới ảnh" lấy captcha mới rồi làm lại.
     last_notice = ""
     for _ in range(max_captcha_retry):
         if not await _captcha_modal_visible(captcha_input):
-            return "FAIL", last_notice or (await get_page_notice(page)) or "Khung mã xác thực đã đóng"
+            popup = await _popup_text(page)
+            if _is_code_verdict(popup):
+                return "FAIL", popup
+            return "RETRY", popup or last_notice or "Khung mã xác thực đã đóng khi chưa có kết quả"
 
-        img_bytes = await _captcha_image_bytes(page, captcha_input)
-        captcha_text = await doc_captcha(img_bytes)
+        # Web báo "Không tải được captcha" hoặc ảnh chưa tải -> làm mới ảnh
+        popup = await _popup_text(page)
+        if CAPTCHA_ERR_RX.search(popup or "") or not await _captcha_loaded(page, captcha_input):
+            last_notice = popup or "Không tải được captcha"
+            await _refresh_until_loaded(page, captcha_input)
+            continue
+
+        try:
+            img_bytes = await _captcha_image_bytes(page, captcha_input)
+            captcha_text = await doc_captcha(img_bytes)
+        except Exception:
+            captcha_text = ""
         if not captcha_text:
-            await refresh_captcha_image(page, captcha_input)
+            await _refresh_until_loaded(page, captcha_input)
             continue
 
         await captcha_input.first.fill(captcha_text)
         if not await click_text_button(page, r"xác thực", below=captcha_input.first):
-            return "FAIL", "Không tìm thấy nút Xác thực trên web"
+            await _refresh_until_loaded(page, captcha_input)
+            continue
 
         outcome, notice = await _wait_after_verify(page, captcha_input)
         low = notice.lower()
         if outcome == "result":
-            if "thành công" in low and "thất bại" not in low:
+            if "thành công" in low and "thất bại" not in low and not _is_captcha_notice(low):
                 return "SUCCESS", notice
-            if not ("captcha" in low or "mã xác thực" in low):
-                # Popup kết quả của web (vd: Nhận Code Thất Bại! Mã CODE không đúng...) -> báo nguyên văn cho admin
-                return "FAIL", notice or "Không có phản hồi từ web"
+            if _is_code_verdict(notice):
+                # Web đã trả lời về CODE (vd: Nhận Code Thất Bại! Mã CODE không đúng...) -> báo nguyên văn
+                return "FAIL", notice
 
+        # Còn lại: captcha sai / lỗi captcha / chưa có kết quả -> làm mới ảnh, nhập lại
         last_notice = notice
-        await refresh_captcha_image(page, captcha_input)
+        await _refresh_until_loaded(page, captcha_input)
 
-    return "FAIL", f"Nhập mã xác thực sai {max_captcha_retry} lần liên tiếp, web vẫn bắt nhập lại"
+    return "RETRY", f"Chưa vượt qua được bước captcha sau {max_captcha_retry} lần ({last_notice or 'web không phản hồi'})"
 
 
 async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, ok: bool, note: str):
@@ -2137,7 +2196,7 @@ async def _attempt_code(code: str, game_username: str, owner_id: int) -> tuple[s
                 notice = await _popup_text(page)
             except Exception:
                 notice = ""
-            if notice and any(k in notice.lower() for k in RESULT_KEYWORDS):
+            if notice and _is_code_verdict(notice):
                 return "FAIL", notice
             return "ERROR", "Tab nhập code bị lỗi thao tác, đã chuyển sang tab khác"
 
@@ -2230,13 +2289,19 @@ async def _run_accounts(accounts, codes: list[str]):
                     done.add(aid)
                     continue
 
-                status, note = "ERROR", ""
-                for attempt in range(2):
+                # Chưa vượt qua bước captcha (RETRY/ERROR) -> nhập lại đúng code này trên tab mới
+                status, note = "RETRY", ""
+                for attempt in range(MAX_ATTEMPTS_PER_CODE):
+                    if aid in done:
+                        break  # tài khoản đã thành công bằng code khác
                     async with _get_tab_sem():
                         status, note = await _attempt_code(code, game_user, owner_id)
-                    if status == "ERROR" and attempt == 0:
-                        continue
-                    break
+                    if status in ("SUCCESS", "FAIL"):
+                        break
+                    await asyncio.sleep(0.3)
+                if status not in ("SUCCESS", "FAIL"):
+                    note = clean_text(note) or "Chưa vượt qua được bước captcha"
+                    note += f" | đã nhập lại {MAX_ATTEMPTS_PER_CODE} lần"
 
                 ok = status == "SUCCESS"
                 if ok:
