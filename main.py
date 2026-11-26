@@ -13,9 +13,8 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import asyncpg
-import ddddocr
-from PIL import Image, ImageEnhance
 import cairosvg
+import ddddocr
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -29,6 +28,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+from PIL import Image, ImageEnhance
 from playwright.async_api import async_playwright
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
@@ -41,7 +41,6 @@ API_ID = int(os.getenv("API_ID", "30309186"))
 API_HASH = os.getenv("API_HASH", "307273bc278e53017b5fdcd407c1d941")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "+84335442999")
 
-# Lấy BOT_TOKEN từ biến môi trường trên Railway
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("Thiếu biến môi trường BOT_TOKEN trên Railway!")
@@ -51,7 +50,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # Phân loại nhóm quét
 TEXT_TARGET_GROUPS = ["official78wins"]
-VIDEO_TARGET_GROUPS = ["FreeCode_78win"]
+VIDEO_TARGET_GROUPS = ["FreeCode_78win", "thongbaocvx"]
 ALL_TARGET_GROUPS = TEXT_TARGET_GROUPS + VIDEO_TARGET_GROUPS
 
 TARGET_URL = "https://code78k.online/"
@@ -188,6 +187,16 @@ main_kb = ReplyKeyboardMarkup(
 SEP = "━━━━━━━━━━━━━━━━━━"
 
 
+def clean_text(raw: str | None) -> str:
+    """Xoá ký tự điều khiển, khoảng trắng thừa và chuẩn hoá dấu câu."""
+    if not raw:
+        return ""
+    s = re.sub(r"[\x00-\x1f\x7f\u200b-\u200f\ufeff]", " ", raw)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+([.,!?;:])", r"\1", s)
+    return s
+
+
 def now_str() -> str:
     return datetime.now(VN_TZ).strftime("%H:%M:%S %d/%m/%Y")
 
@@ -284,7 +293,7 @@ async def get_user_balance(user_id: int) -> int:
 async def add_tx(conn, user_id: int, amount: int, tx_type: str, note: str = ""):
     await conn.execute(
         "INSERT INTO transactions (user_id, amount, type, note) VALUES ($1, $2, $3, $4)",
-        user_id, amount, tx_type, note,
+        user_id, amount, tx_type, clean_text(note),
     )
 
 
@@ -309,7 +318,7 @@ async def admin_login_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(BotStates.waiting_for_otp)
     except Exception as ex:
-        await message.answer(f"{e('no')} Lỗi gửi OTP: <code>{escape(str(ex))}</code>")
+        await message.answer(f"{e('no')} Lỗi gửi OTP: <code>{escape(clean_text(str(ex)))}</code>")
 
 
 @dp.message(BotStates.waiting_for_otp)
@@ -336,7 +345,7 @@ async def admin_login_otp(message: types.Message, state: FSMContext):
         await state.set_state(BotStates.waiting_for_2fa)
     except Exception as ex:
         await message.answer(
-            f"{e('no')} Lỗi xác nhận OTP: <code>{escape(str(ex))}</code>\nGõ <code>/login</code> để thử lại."
+            f"{e('no')} Lỗi xác nhận OTP: <code>{escape(clean_text(str(ex)))}</code>\nGõ <code>/login</code> để thử lại."
         )
         await state.clear()
 
@@ -355,7 +364,7 @@ async def admin_login_2fa(message: types.Message, state: FSMContext):
         asyncio.create_task(start_scanner(session_str))
     except Exception as ex:
         await message.answer(
-            f"{e('no')} Sai mật khẩu 2FA: <code>{escape(str(ex))}</code>\nGõ <code>/login</code> để thử lại."
+            f"{e('no')} Sai mật khẩu 2FA: <code>{escape(clean_text(str(ex)))}</code>\nGõ <code>/login</code> để thử lại."
         )
         await state.clear()
 
@@ -418,7 +427,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 async def build_account(user: types.User):
     info = await get_user_info(user.id)
-    name = escape(user.full_name or "—")
+    name = escape(clean_text(user.full_name) or "—")
     uname = f"@{escape(user.username)}" if user.username else "Chưa đặt"
     joined = info["joined_at"].astimezone(VN_TZ).strftime("%Y-%m-%d %H:%M:%S") if info["joined_at"] else "—"
     text = (
@@ -637,7 +646,7 @@ async def cb_deposit(call: types.CallbackQuery, state: FSMContext):
                 ADMIN_ID,
                 f"{e('bell')} <b>YÊU CẦU XÁC NHẬN NẠP TIỀN</b>\n"
                 f"{SEP}\n"
-                f"{e('user')} Khách: {escape(u.full_name or '')} ({uname})\n"
+                f"{e('user')} Khách: {escape(clean_text(u.full_name))} ({uname})\n"
                 f"{e('link')} ID: <code>{u.id}</code>\n"
                 f"{e('money')} Số tiền: <b>{amount:,}đ</b>\n"
                 f"{e('pin')} Nội dung: <code>{escape(DEPOSIT_PREFIX)} {u.id}</code>\n"
@@ -715,7 +724,8 @@ async def build_history(uid: int, page: int):
             icon = e("plus") if amt >= 0 else e("down")
             sign = "+" if amt >= 0 else "-"
             label = TX_LABELS.get(r["type"], r["type"])
-            note = f" · {escape(r['note'])}" if r["note"] else ""
+            cleaned_note = clean_text(r["note"])
+            note = f" · {escape(cleaned_note)}" if cleaned_note else ""
             lines.append(f"{icon} <b>{sign}{abs(amt):,}đ</b> · {label}")
             lines.append(f"┗ {fmt_dt(r['created_at'])}{note}")
     return "\n".join(lines), page_kb("hist", page, pages)
@@ -764,7 +774,8 @@ async def build_orders(uid: int, page: int):
             created = r["created_at"] or now
             remain = created + timedelta(hours=ORDER_TIMEOUT_HOURS) - now
             mins = max(0, int(remain.total_seconds() // 60))
-            lines.append(f"{e('reload')} <b>{idx}.</b> <code>{escape(r['game_username'])}</code>")
+            acc_name = clean_text(r["game_username"])
+            lines.append(f"{e('reload')} <b>{idx}.</b> <code>{escape(acc_name)}</code>")
             lines.append(f"┗ {game_name} · đặt lúc {fmt_dt(created)} · còn {mins // 60}h{mins % 60:02d}p")
         lines.append("")
         lines.append(
@@ -909,8 +920,8 @@ async def buy_start(call: types.CallbackQuery, state: FSMContext):
 
 def parse_usernames(raw: str) -> list[str]:
     seen, names = set(), []
-    for line in raw.splitlines():
-        name = line.strip()
+    for line in (raw or "").splitlines():
+        name = clean_text(line)
         if not name:
             continue
         key = name.lower()
@@ -1123,7 +1134,7 @@ async def expire_old_orders():
 
     for uid, items in refunds.items():
         total = sum(p for _, p in items)
-        names = "\n".join(f"• <code>{escape(n)}</code>" for n, _ in items)
+        names = "\n".join(f"• <code>{escape(clean_text(n))}</code>" for n, _ in items)
         try:
             await bot.send_message(
                 uid,
@@ -1228,7 +1239,7 @@ async def admin_cancel_order(message: types.Message):
     if len(parts) < 2 or not parts[1].strip():
         await message.answer(f"{e('no')} Cú pháp: <code>/huy &lt;ten_tai_khoan&gt;</code>")
         return
-    name = parts[1].strip()
+    name = clean_text(parts[1])
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "UPDATE hunt_accounts SET status = 'cancelled' "
@@ -1247,7 +1258,7 @@ async def admin_cancel_order(message: types.Message):
         try:
             await bot.send_message(
                 r["user_id"],
-                f"{e('no')} Đơn nhập code của tài khoản <code>{escape(r['game_username'])}</code> "
+                f"{e('no')} Đơn nhập code của tài khoản <code>{escape(clean_text(r['game_username']))}</code> "
                 f"đã bị Admin hủy.",
             )
         except Exception:
@@ -1279,14 +1290,13 @@ async def admin_stats(message: types.Message):
 def extract_clean_codes(raw_text: str) -> list[str]:
     """
     Lọc các chuỗi code có ký tự rác xen kẽ (ví dụ NrTs.WA@, hfAh!RE#, uJRJ.RC@),
-    xóa hết ký tự đặc biệt / gạch ngang / gạch chéo, chỉ giữ lại chữ hoa, chữ thường và số
+    xoá hết ký tự đặc biệt / gạch ngang / gạch chéo, chỉ giữ lại chữ hoa, chữ thường và số
     có độ dài đúng 6 ký tự.
     """
     clean_codes = []
     for w in (raw_text or "").split():
         if w.startswith(("http", "#", "@")):
             continue
-        # Chỉ nhận các cụm có chứa ký tự đặc biệt xen kẽ chữ/số (tránh nhận nhầm chữ bình thường như 'TẶNG', 'MỖI')
         if re.search(r"[^a-zA-Z0-9]", w) and re.search(r"[a-zA-Z0-9]", w):
             cleaned = re.sub(r"[^a-zA-Z0-9]", "", w)
             if len(cleaned) == 6:
@@ -1299,21 +1309,19 @@ def _ocr_video_frame_sync(img_path: str) -> str:
     with Image.open(img_path) as im:
         im = im.convert("L")
         w, h = im.size
-        # Cắt 45% bên trái màn hình video, bỏ 15% mép trên và 18% mép dưới (banner chữ vàng)
         crop_box = (0, int(h * 0.15), int(w * 0.45), int(h * 0.82))
         cropped = im.crop(crop_box)
         cw, ch = cropped.size
         cropped = cropped.resize((cw * 2, ch * 2), Image.Resampling.LANCZOS)
         cropped = ImageEnhance.Contrast(cropped).enhance(2.2)
 
-        # Cắt ngang làm 5 dải để ddddocr đọc từng dòng code chính xác hơn
         lines_text = []
         step = ch * 2 // 5
         for i in range(5):
             strip = cropped.crop((0, i * step, cw * 2, (i + 1) * step))
             buf = BytesIO()
             strip.save(buf, format="PNG")
-            txt = ocr.classification(buf.getvalue())
+            txt = clean_text(ocr.classification(buf.getvalue()))
             if txt:
                 lines_text.append(txt)
         return " ".join(lines_text)
@@ -1374,24 +1382,58 @@ async def refresh_captcha_image(page, captcha_img, captcha_input):
         await captcha_input.wait_for(state="visible", timeout=8000)
 
 
+def _format_notice_lines(raw_text: str) -> str:
+    """Làm sạch nội dung thông báo trên web và xoá dòng nút bấm thừa."""
+    ignore_lines = {"đóng", "chăm sóc khách hàng 24/7", "xác thực", "kiểm tra", "làm mới ảnh"}
+    cleaned_lines = []
+    seen = set()
+    for line in (raw_text or "").splitlines():
+        item = clean_text(line)
+        if not item:
+            continue
+        if item.lower() in ignore_lines:
+            continue
+        if item.lower() not in seen:
+            seen.add(item.lower())
+            cleaned_lines.append(item)
+    return " | ".join(cleaned_lines)[:250]
+
+
 async def get_page_notice(page) -> str:
+    """Lấy đúng nội dung ghi chú/thông báo hiển thị trên web sau khi nhập code."""
     try:
-        for sel in ('[role="alert"]', ".swal2-html-container", ".toast", ".alert", ".notification"):
+        selectors = (
+            ".swal2-popup",
+            ".swal2-html-container",
+            '[role="dialog"]',
+            '[role="alert"]',
+            ".modal-content",
+            ".toast",
+            ".alert",
+            ".notification",
+        )
+        for sel in selectors:
             loc = page.locator(sel)
-            if await loc.count() > 0:
-                txt = re.sub(r"\s+", " ", (await loc.first.inner_text()).strip())
-                if txt:
-                    return txt[:200]
-        body = re.sub(r"\s+", " ", await page.inner_text("body")).strip()
-        return body[-200:]
+            count = await loc.count()
+            for idx in range(count - 1, -1, -1):
+                item = loc.nth(idx)
+                if await item.is_visible():
+                    txt = _format_notice_lines(await item.inner_text())
+                    if txt:
+                        return txt
+        body = _format_notice_lines(await page.inner_text("body"))
+        return body[-250:]
     except Exception:
         return ""
 
 
 async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 4) -> tuple[str, str]:
+    clean_code = clean_text(code)
+    clean_user = clean_text(game_username)
+
     await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
-    await page.fill('input[placeholder*="Nhập code"]', code)
-    await page.fill('input[placeholder*="Nhập tài khoản"]', game_username)
+    await page.fill('input[placeholder*="Nhập code"]', clean_code)
+    await page.fill('input[placeholder*="Nhập tài khoản"]', clean_user)
     await page.click('button:has-text("KIỂM TRA")')
 
     captcha_input = page.locator('input[placeholder*="Nhập mã captcha"]')
@@ -1413,32 +1455,34 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
         await page.click('button:has-text("Xác thực")')
         await page.wait_for_timeout(1500)
 
-        body_text = (await page.inner_text("body")).lower()
-        if "thành công" in body_text or "nhận được" in body_text or "cộng" in body_text:
-            notice = await get_page_notice(page)
-            return "SUCCESS", f"Web báo nhập code thành công. Phản hồi: {notice}" if notice else "Web báo nhập code thành công"
+        notice = await get_page_notice(page)
+        body_text = (notice or (await page.inner_text("body"))).lower()
 
-        if "captcha" in body_text or "mã xác thực" in body_text or "không đúng" in body_text:
+        if "thành công" in body_text or "nhận được" in body_text or "cộng" in body_text:
+            return "SUCCESS", notice or "Thành công"
+
+        if "captcha" in body_text or "mã xác thực" in body_text:
             await refresh_captcha_image(page, captcha_img, captcha_input)
             continue
 
-        notice = await get_page_notice(page)
-        return "FAIL", f"Code không hợp lệ / hết lượt / đã được dùng. Phản hồi web: {notice}"
+        return "FAIL", notice or "Không có phản hồi từ web"
 
-    return "FAIL", f"Giải captcha sai sau {max_captcha_retry} lần thử"
+    notice = await get_page_notice(page)
+    return "FAIL", notice or f"Giải captcha sai sau {max_captcha_retry} lần thử"
 
 
 async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, ok: bool, note: str):
     head = (
         f"{e('ok')} <b>NHẬP CODE THÀNH CÔNG</b>" if ok else f"{e('no')} <b>NHẬP CODE THẤT BẠI</b>"
     )
+    final_note = clean_text(note) or "Không có ghi chú"
     text = (
         f"{head}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"{e('pc')} Tài khoản: <code>{escape(game_username)}</code>\n"
-        f"{e('new')} Mã code nhập: <code>{escape(code)}</code>\n"
+        f"{e('pc')} Tài khoản: <code>{escape(clean_text(game_username))}</code>\n"
+        f"{e('new')} Mã code nhập: <code>{escape(clean_text(code))}</code>\n"
         f"{e('shield')} Chủ đơn: <code>{owner_id}</code>\n"
-        f"{e('mail')} Ghi chú: {escape(note)}\n"
+        f"{e('mail')} Ghi chú: {escape(final_note)}\n"
         f"{e('soon')} Thời gian: {now_str()}"
     )
     try:
@@ -1456,7 +1500,7 @@ async def chay_nhap_code_cho_tai_khoan(codes: list[str], game_username: str, own
                 try:
                     status, note = await thu_mot_code(page, code, game_username)
                 except Exception as ex:
-                    status, note = "FAIL", f"Lỗi khi nhập: {ex}"
+                    status, note = "FAIL", clean_text(str(ex)) or "Lỗi khi nhập"
 
                 ok = status == "SUCCESS"
                 await report_attempt_to_admin(code, game_username, owner_id, ok, note)
@@ -1469,16 +1513,18 @@ async def chay_nhap_code_cho_tai_khoan(codes: list[str], game_username: str, own
 
 async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
     """Gửi bộ code vừa quét được (từ tin nhắn hoặc video) vào tất cả tài khoản đang chờ."""
-    if not codes:
+    cleaned_codes = [clean_text(c) for c in codes if clean_text(c)]
+    cleaned_codes = list(dict.fromkeys(cleaned_codes))
+    if not cleaned_codes:
         return
 
     try:
-        code_list_str = ", ".join(f"<code>{escape(c)}</code>" for c in codes)
+        code_list_str = ", ".join(f"<code>{escape(c)}</code>" for c in cleaned_codes)
         await bot.send_message(
             ADMIN_ID,
-            f"{e('fast')} <b>QUÉT ĐƯỢC CODE MỚI ({escape(source_label)})</b>\n"
+            f"{e('fast')} <b>QUÉT ĐƯỢC CODE MỚI ({escape(clean_text(source_label))})</b>\n"
             f"{SEP}\n"
-            f"{e('new')} Danh sách ({len(codes)} mã): {code_list_str}",
+            f"{e('new')} Danh sách ({len(cleaned_codes)} mã): {code_list_str}",
         )
     except Exception:
         pass
@@ -1491,10 +1537,10 @@ async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
     for acc in accounts:
         record_id = acc["id"]
         owner_id = acc["user_id"]
-        game_user = acc["game_username"]
+        game_user = clean_text(acc["game_username"])
 
         try:
-            won_code = await chay_nhap_code_cho_tai_khoan(codes, game_user, owner_id)
+            won_code = await chay_nhap_code_cho_tai_khoan(cleaned_codes, game_user, owner_id)
             if won_code:
                 async with db_pool.acquire() as conn:
                     await conn.execute(
@@ -1522,7 +1568,7 @@ async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
                 await bot.send_message(
                     ADMIN_ID,
                     f"{e('no')} <b>LỖI HỆ THỐNG</b> khi nhập code cho <code>{escape(game_user)}</code>:\n"
-                    f"<code>{escape(str(ex))}</code>",
+                    f"<code>{escape(clean_text(str(ex)))}</code>",
                 )
             except Exception:
                 pass
@@ -1538,17 +1584,19 @@ async def start_scanner(session_str: str):
 
     userbot = TelegramClient(StringSession(session_str), API_ID, API_HASH)
 
-    # 1. Nhóm FreeCode_78win -> Chỉ quét video gửi lên
+    # 1. Các nhóm video (FreeCode_78win, thongbaocvx) -> Chỉ quét video gửi lên
     @userbot.on(events.NewMessage(chats=VIDEO_TARGET_GROUPS))
     async def video_scanner_handler(event):
         if not event.message or not event.message.video:
             return
         try:
+            chat = await event.get_chat()
+            group_name = getattr(chat, "username", None) or "video_group"
             codes = await extract_codes_from_video_message(event.message)
             if codes:
-                await dispatch_codes_to_accounts(codes, "Video FreeCode_78win")
+                await dispatch_codes_to_accounts(codes, f"Video {group_name}")
         except Exception as ex:
-            print(f"Lỗi quét video FreeCode_78win: {ex}")
+            print(f"Lỗi quét video: {ex}")
 
     # 2. Nhóm official78wins -> Chỉ quét tin nhắn văn bản
     @userbot.on(events.NewMessage(chats=TEXT_TARGET_GROUPS))
