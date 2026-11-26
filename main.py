@@ -1840,22 +1840,15 @@ def _to_png(im: Image.Image) -> bytes:
 
 
 def _ocr_variants(img_bytes: bytes) -> list[bytes]:
-    """
-    Xử lý chuyên cho captcha của code78k.online (chữ in hoa nét rỗng + đường kẻ ngang mảnh):
-      - Phóng to 3x, thêm viền trắng để OCR không cắt mất ký tự đầu/cuối.
-      - Lọc trung vị + làm dày nét (MinFilter) để xoá bớt đường kẻ ngang mảnh và nối liền nét chữ rỗng.
-    """
     variants = [img_bytes]
     base = Image.open(BytesIO(img_bytes)).convert("L")
     base = ImageOps.expand(base, border=12, fill=255)
     w, h = base.size
     up3 = base.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
 
-    # Bản 1: tăng tương phản mạnh
     v1 = ImageEnhance.Contrast(up3).enhance(2.4)
     variants.append(_to_png(v1))
 
-    # Bản 2: nhị phân + xoá đường kẻ ngang mảnh (MedianFilter) + làm liền nét chữ rỗng (MinFilter)
     bw = v1.point(lambda p: 0 if p < 185 else 255, mode="L")
     clean_line = bw.filter(ImageFilter.MedianFilter(size=3))
     thick_char = clean_line.filter(ImageFilter.MinFilter(size=3))
@@ -1873,7 +1866,6 @@ def _ocr_sync(img_bytes: bytes) -> str:
         except Exception:
             continue
         if CAPTCHA_MIN_LEN <= len(text) <= CAPTCHA_MAX_LEN:
-            # Ưu tiên kết quả có độ dài 5 ký tự (định dạng chuẩn của web) và bản đã lọc đường kẻ
             weight = 2 if len(text) == 5 else 1
             if idx in (2, 3):
                 weight += 1
@@ -1980,6 +1972,24 @@ async def _captcha_image_bytes(page, captcha_input) -> bytes:
     return await page.screenshot(clip={"x": ibox["x"], "y": y, "width": width, "height": height})
 
 
+async def _fill_input_reliable(page, locator_first, value: str):
+    """Điền giá trị vào ô nhập và kích hoạt sự kiện input/change để web nhận chắc chắn."""
+    await locator_first.click(timeout=3000)
+    await locator_first.fill("")
+    await locator_first.fill(value)
+    try:
+        await locator_first.evaluate(
+            """(el, val) => {
+                el.value = val;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            value,
+        )
+    except Exception:
+        pass
+
+
 async def refresh_captcha_image(page, captcha_input) -> bool:
     """Bấm 'Làm mới ảnh' (hoặc bấm trực tiếp vào ảnh captcha) và chờ ảnh mới hiện lên."""
     try:
@@ -2084,7 +2094,7 @@ async def _captcha_modal_visible(captcha_input) -> bool:
         return False
 
 
-async def _wait_after_verify(page, captcha_input, timeout_ms: int = 2800) -> tuple[str, str]:
+async def _wait_after_verify(page, captcha_input, timeout_ms: int = 3200) -> tuple[str, str]:
     deadline = time.perf_counter() + timeout_ms / 1000
     hidden_since = None
     while time.perf_counter() < deadline:
@@ -2101,12 +2111,12 @@ async def _wait_after_verify(page, captcha_input, timeout_ms: int = 2800) -> tup
                 return "result", txt or await get_page_notice(page)
         await page.wait_for_timeout(80)
     if await _captcha_modal_visible(captcha_input):
-        return "captcha_wrong", ""
+        return "captcha_wrong", await _popup_text(page)
     return "result", await get_page_notice(page)
 
 
 CAPTCHA_ERR_RX = re.compile(r"không tải được captcha|tải captcha|làm mới hoặc thử lại", re.I)
-MAX_ATTEMPTS_PER_CODE = 2  # tránh spam làm web chặn captcha
+MAX_ATTEMPTS_PER_CODE = 3
 
 
 def _is_captcha_notice(low: str) -> bool:
@@ -2128,12 +2138,19 @@ async def _captcha_loaded(page, captcha_input) -> bool:
         return True
 
 
+async def _wait_captcha_ready(page, captcha_input, max_wait_ms: int = 1200):
+    """Chờ ảnh captcha hoàn tất tải trước khi chụp."""
+    steps = max(1, max_wait_ms // 120)
+    for _ in range(steps):
+        if await _captcha_loaded(page, captcha_input):
+            await page.wait_for_timeout(80)
+            return
+        await page.wait_for_timeout(120)
+
+
 async def _refresh_until_loaded(page, captcha_input):
     await refresh_captcha_image(page, captcha_input)
-    for _ in range(8):
-        if await _captcha_loaded(page, captcha_input):
-            return
-        await page.wait_for_timeout(150)
+    await _wait_captcha_ready(page, captcha_input, max_wait_ms=1200)
 
 
 async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 5, stop_check=None) -> tuple[str, str]:
@@ -2151,8 +2168,8 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
     await _reset_page_state_fast(page)
 
     # BƯỚC 1: điền code + tài khoản
-    await code_input.first.fill(clean_code)
-    await user_input.first.fill(clean_user)
+    await _fill_input_reliable(page, code_input.first, clean_code)
+    await _fill_input_reliable(page, user_input.first, clean_user)
 
     # BƯỚC 2: bấm KIỂM TRA
     if not await click_text_button(page, r"kiểm tra", below=user_input.first):
@@ -2167,7 +2184,9 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
             return "FAIL", popup
         return "RETRY", popup or "Web không hiện khung mã xác thực"
 
-    # BƯỚC 4: đọc captcha -> nhập -> Xác thực
+    await _wait_captcha_ready(page, captcha_input, max_wait_ms=1200)
+
+    # BƯỚC 4: luôn đọc mã trong ảnh -> nhập vào ô "Nhập mã captcha" -> bấm "Xác thực" để nhận phản hồi
     last_notice = ""
     for _ in range(max_captcha_retry):
         if stop_check and stop_check():
@@ -2178,36 +2197,32 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
                 return "FAIL", popup
             return "RETRY", popup or last_notice or "Khung mã xác thực đã đóng"
 
-        popup = await _popup_text(page)
-        if CAPTCHA_ERR_RX.search(popup or "") or not await _captcha_loaded(page, captcha_input):
-            last_notice = popup or "Không tải được captcha"
-            await _refresh_until_loaded(page, captcha_input)
-            continue
-
         try:
             img_bytes = await _captcha_image_bytes(page, captcha_input)
             captcha_text = await doc_captcha(img_bytes)
         except Exception:
             captcha_text = ""
-        if not captcha_text:
-            await _refresh_until_loaded(page, captcha_input)
-            continue
 
-        await captcha_input.first.fill(captcha_text.upper())
-        if not await click_text_button(page, r"xác thực", below=captcha_input.first):
-            await _refresh_until_loaded(page, captcha_input)
-            continue
+        # Nếu đọc được mã thì nhập thẳng vào ô captcha và bấm Xác thực để lấy phản hồi thật
+        if captcha_text:
+            await _fill_input_reliable(page, captcha_input.first, captcha_text.upper())
+            if await click_text_button(page, r"xác thực", below=captcha_input.first):
+                outcome, notice = await _wait_after_verify(page, captcha_input)
+                low = notice.lower()
+                if outcome == "result":
+                    if "thành công" in low and "thất bại" not in low and not _is_captcha_notice(low):
+                        return "SUCCESS", notice
+                    if _is_code_verdict(notice):
+                        return "FAIL", notice
+                last_notice = notice or last_notice
 
-        outcome, notice = await _wait_after_verify(page, captcha_input)
-        low = notice.lower()
-        if outcome == "result":
-            if "thành công" in low and "thất bại" not in low and not _is_captcha_notice(low):
-                return "SUCCESS", notice
-            if _is_code_verdict(notice):
-                return "FAIL", notice
-
-        last_notice = notice
+        # Nếu chưa đọc được mã hoặc web vẫn báo lỗi captcha -> làm mới ảnh rồi thử lại
         await _refresh_until_loaded(page, captcha_input)
+        cur_popup = await _popup_text(page)
+        if cur_popup and _is_code_verdict(cur_popup):
+            return "FAIL", cur_popup
+        if cur_popup:
+            last_notice = cur_popup
 
     return "RETRY", f"Chưa vượt qua bước captcha ({last_notice or 'sai captcha'})"
 
