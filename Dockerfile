@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -22,6 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libatspi2.0-0 \
     libwayland-client0 \
     fonts-liberation \
+    libcairo2 \
+    libpango-1.0-0 \
+    libgdk-pixbuf-2.0-0 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
