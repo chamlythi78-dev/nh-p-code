@@ -2144,6 +2144,17 @@ async def _wait_after_verify(page, captcha_input, timeout_ms: int = 3200) -> tup
     return "result", await get_page_notice(page)
 
 
+CAPTCHA_CONCURRENCY = int(os.getenv("CAPTCHA_CONCURRENCY", "2"))  # số tab được xin captcha cùng lúc
+_captcha_gate: asyncio.Semaphore | None = None
+
+
+def _get_captcha_gate() -> asyncio.Semaphore:
+    global _captcha_gate
+    if _captcha_gate is None:
+        _captcha_gate = asyncio.Semaphore(max(1, CAPTCHA_CONCURRENCY))
+    return _captcha_gate
+
+
 CAPTCHA_ERR_RX = re.compile(r"không tải được captcha|tải captcha|làm mới hoặc thử lại", re.I)
 MAX_ATTEMPTS_PER_CODE = 4   # tối đa 4 lần, MỖI LẦN MỘT TAB KHÁC NHAU
 CAPTCHA_LOAD_FAIL = "Không tải được captcha"
@@ -2201,25 +2212,25 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
     await _fill_input_reliable(page, code_input.first, clean_code)
     await _fill_input_reliable(page, user_input.first, clean_user)
 
-    # BƯỚC 2: bấm KIỂM TRA
-    if not await click_text_button(page, r"kiểm tra", below=user_input.first):
-        return "RETRY", "Không tìm thấy nút Kiểm tra trên web"
+    # BƯỚC 2+3: bấm KIỂM TRA và chờ ảnh captcha tải xong.
+    # Chỉ cho vài tab xin captcha cùng lúc (web chặn khi xin dồn dập); tải xong là nhả cổng ngay.
+    async with _get_captcha_gate():
+        if not await click_text_button(page, r"kiểm tra", below=user_input.first):
+            return "RETRY", "Không tìm thấy nút Kiểm tra trên web"
 
-    # BƯỚC 3: chờ khung "Mã xác thực" hiện ra
-    try:
-        await captcha_input.first.wait_for(state="visible", timeout=4000)
-    except Exception:
-        popup = await _popup_text(page)
-        if _is_code_verdict(popup):
-            return "FAIL", popup
-        return "RETRY", popup or "Web không hiện khung mã xác thực"
+        try:
+            await captcha_input.first.wait_for(state="visible", timeout=4000)
+        except Exception:
+            popup = await _popup_text(page)
+            if _is_code_verdict(popup):
+                return "FAIL", popup
+            return "RETRY", popup or "Web không hiện khung mã xác thực"
 
-    await _wait_captcha_ready(page, captcha_input, max_wait_ms=700)
+        await _wait_captcha_ready(page, captcha_input, max_wait_ms=900)
 
-    # Captcha không tải được => bỏ tab này NGAY, vòng ngoài sẽ đổi sang tab khác
-    modal_txt = await _popup_text(page)
-    if CAPTCHA_ERR_RX.search(modal_txt or "") or not await _captcha_loaded(page, captcha_input):
-        return "RETRY", CAPTCHA_LOAD_FAIL
+        modal_txt = await _popup_text(page)
+        if CAPTCHA_ERR_RX.search(modal_txt or "") or not await _captcha_loaded(page, captcha_input):
+            return "RETRY", CAPTCHA_LOAD_FAIL
 
     # BƯỚC 4: đọc mã trong ảnh -> nhập vào ô "Nhập mã captcha" -> bấm "Xác thực"
     last_notice = ""
@@ -2410,6 +2421,7 @@ async def _run_accounts(accounts, codes: list[str]):
 
         state = {"final": None, "last_note": ""}
         used_tabs: set = set()
+        attempt_no = 0
 
         def stop() -> bool:
             return aid in done or state["final"] is not None
@@ -2427,6 +2439,9 @@ async def _run_accounts(accounts, codes: list[str]):
             if status == "SKIP":
                 break
             state["last_note"] = note        # RETRY/ERROR -> vòng sau lấy TAB KHÁC
+            if CAPTCHA_LOAD_FAIL in (note or ""):
+                attempt_no += 1
+                await asyncio.sleep(0.8 * attempt_no)   # web đang chặn xin captcha -> nghỉ rồi mới thử lại
 
         final = state["final"]
         if final is None:
