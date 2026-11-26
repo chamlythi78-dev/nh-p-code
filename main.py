@@ -15,13 +15,13 @@ from aiogram.fsm.state import State, StatesGroup
 from playwright.async_api import async_playwright
 
 # --- CẤU HÌNH TRỰC TIẾP (CHỈ CẦN ĐIỀN HOẶC ĐỂ TRONG ENV RAILWAY) ---
-API_ID = int(os.getenv("API_ID", "12345678"))
-API_HASH = os.getenv("API_HASH", "dien_api_hash_cua_ban")
-PHONE_NUMBER = os.getenv("PHONE_NUMBER", "+849xxxxxxxx")
+API_ID = int(os.getenv("API_ID", "30309186"))
+API_HASH = os.getenv("API_HASH", "307273bc278e53017b5fdcd407c1d941")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER", "+84335442999")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "dien_token_bot_quan_ly")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9044293543:AAEFP_xv45GUuR76f382cekrDOaCjdE2zLw")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "9220244280"))
 
 # Railway tự cấp DATABASE_URL khi bạn thêm plugin PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL", "")
