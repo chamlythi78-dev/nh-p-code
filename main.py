@@ -1,7 +1,10 @@
 import asyncio
+import glob
 import math
 import os
 import re
+import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -38,16 +41,24 @@ API_ID = int(os.getenv("API_ID", "30309186"))
 API_HASH = os.getenv("API_HASH", "307273bc278e53017b5fdcd407c1d941")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "+84335442999")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9044293543:AAFsfySOxWfONgQUOOrdAYHK87HfIYMaqhU")
+# Lấy BOT_TOKEN từ biến môi trường trên Railway
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise RuntimeError("Thiếu biến môi trường BOT_TOKEN trên Railway!")
+
 ADMIN_ID = int(os.getenv("ADMIN_ID", "9220244280"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-TARGET_GROUPS = ["official78wins", "FreeCode_78win"]
+# Phân loại nhóm quét
+TEXT_TARGET_GROUPS = ["official78wins"]
+VIDEO_TARGET_GROUPS = ["FreeCode_78win"]
+ALL_TARGET_GROUPS = TEXT_TARGET_GROUPS + VIDEO_TARGET_GROUPS
+
 TARGET_URL = "https://code78k.online/"
 CODE_PRICE = 10000
-MAX_BATCH = 30  # số tài khoản tối đa đăng ký trong 1 lần
-ORDER_TIMEOUT_HOURS = 72  # quá hạn chưa nhập code -> tự huỷ + hoàn tiền
-PAGE_SIZE = 8  # số dòng mỗi trang (lịch sử / đơn hàng)
+MAX_BATCH = 30
+ORDER_TIMEOUT_HOURS = 72
+PAGE_SIZE = 8
 
 # Hỗ trợ
 SUPPORT_GROUP = "khututricvx"
@@ -55,23 +66,22 @@ SUPPORT_ADMIN = "dgfrutil"
 
 # Nạp tiền
 BANK_NAME = "KIENLONGBANK"
-BANK_CODE = "KLB"  # mã ngân hàng theo VietQR
+BANK_CODE = "KLB"
 BANK_ACCOUNT_NAME = "BAN TIEN PHONG"
 BANK_ACCOUNT_NO = "6530052011"
-DEPOSIT_PREFIX = "nap tien code tu dong"  # 5 chữ + ID người dùng
+DEPOSIT_PREFIX = "nap tien code tu dong"
 MIN_DEPOSIT = 10000
 MAX_DEPOSIT = 50_000_000
 QUICK_AMOUNTS = [10000, 20000, 50000, 100000, 500000, 1000000]
 
 VN_TZ = timezone(timedelta(hours=7))
 
-# Danh sách game cho slot nhập code (hiện chỉ có 78WIN)
 GAMES = {
     "78win": {"name": "78WIN", "price": CODE_PRICE},
 }
 
 # =====================================================================
-# EMOJI PREMIUM  (tên: (id emoji premium, emoji dự phòng))
+# EMOJI PREMIUM
 # =====================================================================
 EMOJI_TABLE = {
     "ok": ("5206607081334906820", "✔️"),
@@ -111,7 +121,6 @@ EMOJI_TABLE = {
     "globe": ("5447410659077661506", "🌐"),
     "user": ("6066579956287148786", "👨‍💻"),
     "up": ("5415655814079723871", "🔝"),
-    # các emoji cũ giữ nguyên
     "top": ("5341498088408234504", "💯"),
     "soon": ("5440621591387980068", "🔜"),
     "pc": ("5282843764451195532", "🖥"),
@@ -123,7 +132,6 @@ FALLBACK = {k: v[1] for k, v in EMOJI_TABLE.items()}
 
 
 def e(name: str) -> str:
-    """Emoji premium dạng HTML (tự hiện emoji thường nếu không hỗ trợ)."""
     return f'<tg-emoji emoji-id="{EMOJI[name]}">{FALLBACK[name]}</tg-emoji>'
 
 
@@ -149,7 +157,7 @@ db_pool: asyncpg.Pool | None = None
 userbot: TelegramClient | None = None
 temp_login_client: TelegramClient | None = None
 background_tasks: list[asyncio.Task] = []
-paid_notify_at: dict[int, float] = {}  # chống spam nút "Đã chuyển khoản"
+paid_notify_at: dict[int, float] = {}
 
 
 class BotStates(StatesGroup):
@@ -232,7 +240,6 @@ async def init_db():
             )
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions (user_id, id DESC)")
-        # Chặn trùng ở tầng DB: 1 tài khoản game chỉ được có 1 đơn đang chờ
         try:
             await conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_game_account
@@ -240,7 +247,7 @@ async def init_db():
                 WHERE status = 'active'
             """)
         except Exception as ex:
-            print(f"Không tạo được unique index (dữ liệu cũ có thể bị trùng): {ex}")
+            print(f"Không tạo được unique index: {ex}")
 
 
 async def get_saved_session() -> str:
@@ -258,7 +265,6 @@ async def save_session(session_str: str):
 
 
 async def get_user_info(user_id: int):
-    """Trả về record (balance, total_deposit, joined_at); tự tạo user nếu chưa có."""
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO users (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING",
@@ -276,7 +282,6 @@ async def get_user_balance(user_id: int) -> int:
 
 
 async def add_tx(conn, user_id: int, amount: int, tx_type: str, note: str = ""):
-    """Ghi 1 dòng lịch sử giao dịch (amount dương = cộng, âm = trừ)."""
     await conn.execute(
         "INSERT INTO transactions (user_id, amount, type, note) VALUES ($1, $2, $3, $4)",
         user_id, amount, tx_type, note,
@@ -359,7 +364,6 @@ async def admin_login_2fa(message: types.Message, state: FSMContext):
 # TIỆN ÍCH GIAO DIỆN
 # =====================================================================
 async def edit_or_send(call: types.CallbackQuery, text: str, kb: InlineKeyboardMarkup | None = None):
-    """Sửa tin nhắn hiện tại; nếu không sửa được (tin ảnh QR, không đổi...) thì gửi tin mới."""
     try:
         await call.message.edit_text(text, reply_markup=kb)
     except TelegramBadRequest:
@@ -412,7 +416,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await message.answer(home_text(bal), reply_markup=main_kb)
 
 
-# ---- Tài Khoản -------------------------------------------------------
 async def build_account(user: types.User):
     info = await get_user_info(user.id)
     name = escape(user.full_name or "—")
@@ -445,7 +448,6 @@ async def menu_account(message: types.Message, state: FSMContext):
     await message.answer(text, reply_markup=kb)
 
 
-# ---- Nạp Tiền --------------------------------------------------------
 def amount_label(amount: int) -> str:
     if amount >= 1_000_000 and amount % 1_000_000 == 0:
         return f"{amount // 1_000_000}M"
@@ -484,7 +486,6 @@ async def menu_deposit(message: types.Message, state: FSMContext):
 
 
 def parse_amount(raw: str) -> int | None:
-    """Hiểu: 50000, 50.000, 50,000, 50k, 1m, 1.5m, 2tr ..."""
     s = (raw or "").strip().lower().replace(" ", "").replace("đ", "").replace("vnd", "")
     m = re.fullmatch(r"(\d+(?:[.,]\d+)?)(k|m|tr|nghin|ngan)?", s)
     if not m:
@@ -505,7 +506,6 @@ def vietqr_url(amount: int, content: str) -> str:
 
 
 def _download_vietqr_image(url: str) -> bytes:
-    """Tải và chuẩn hóa ảnh QR thành PNG RGB nhỏ, tương thích Telegram."""
     request = Request(
         url,
         headers={
@@ -522,8 +522,6 @@ def _download_vietqr_image(url: str) -> bytes:
     if len(raw_data) > 5 * 1024 * 1024:
         raise ValueError("Ảnh QR tải về vượt quá giới hạn 5 MB")
 
-    # VietQR đôi khi trả SVG dù URL có đuôi .png. Render SVG thành PNG
-    # trước, sau đó dùng Pillow chuẩn hóa thành RGB để Telegram nhận ổn định.
     image_bytes = raw_data
     looks_like_svg = (
         "image/svg" in content_type
@@ -551,13 +549,12 @@ def _download_vietqr_image(url: str) -> bytes:
             f"(Content-Type: {content_type}; dữ liệu đầu: {preview})"
         ) from exc
 
-    # Giữ ảnh QR trong kích thước an toàn, tránh ảnh quá lớn hoặc tỷ lệ lạ.
     image.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
     output = BytesIO()
     image.save(output, format="PNG", optimize=True)
     png_data = output.getvalue()
 
-    if not png_data.startswith(b"\\x89PNG\\r\\n\\x1a\\n"):
+    if not png_data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("Không thể chuẩn hóa ảnh QR thành PNG")
     if len(png_data) > 10 * 1024 * 1024:
         raise ValueError("Ảnh QR sau chuẩn hóa vượt quá giới hạn Telegram")
@@ -584,9 +581,6 @@ async def send_deposit_qr(target: types.Message, uid: int, amount: int):
         [inline_btn("Đổi số tiền", "reload", "dep:menu"), inline_btn("Menu Chính", "up", "home")],
     ])
     try:
-        # Tải ảnh về máy bot trước, sau đó upload bytes lên Telegram.
-        # Telegram không còn phải tự tải URL img.vietqr.io nên tránh lỗi
-        # "failed to get HTTP URL content".
         qr_data = await asyncio.to_thread(_download_vietqr_image, vietqr_url(amount, content))
         qr_file = types.BufferedInputFile(qr_data, filename=f"vietqr_{uid}_{amount}.png")
         await target.answer_photo(photo=qr_file, caption=caption, reply_markup=kb)
@@ -656,7 +650,6 @@ async def cb_deposit(call: types.CallbackQuery, state: FSMContext):
         await call.answer("Đã gửi yêu cầu cho Admin, tiền sẽ được cộng sau khi kiểm tra.", show_alert=True)
         return
 
-    # dep:<so_tien>
     try:
         amount = int(action)
     except ValueError:
@@ -690,7 +683,6 @@ async def deposit_custom_amount(message: types.Message, state: FSMContext):
     await send_deposit_qr(message, message.from_user.id, amount)
 
 
-# ---- Lịch Sử ---------------------------------------------------------
 TX_LABELS = {
     "deposit": "Nạp tiền",
     "purchase": "Mua slot nhập code",
@@ -744,7 +736,6 @@ async def cb_history(call: types.CallbackQuery):
     await call.answer()
 
 
-# ---- Đơn Hàng --------------------------------------------------------
 async def build_orders(uid: int, page: int):
     async with db_pool.acquire() as conn:
         total = await conn.fetchval(
@@ -797,7 +788,6 @@ async def cb_orders(call: types.CallbackQuery):
     await call.answer()
 
 
-# ---- Nhóm Hỗ Trợ -----------------------------------------------------
 @dp.message(F.text == BTN_SUPPORT)
 async def menu_support(message: types.Message, state: FSMContext):
     await state.clear()
@@ -816,7 +806,6 @@ async def menu_support(message: types.Message, state: FSMContext):
     )
 
 
-# ---- Nhập Code -------------------------------------------------------
 def game_list_content(bal: int):
     text = (
         f"{e('fire')} <b>NHẬP CODE</b>\n"
@@ -956,7 +945,6 @@ async def buy_code_preview(message: types.Message, state: FSMContext):
     price = game["price"]
     uid = message.from_user.id
 
-    # Xem trước: loại các nick đang có đơn chờ
     async with db_pool.acquire() as conn:
         busy_rows = await conn.fetch(
             "SELECT lower(game_username) AS u FROM hunt_accounts "
@@ -1022,13 +1010,11 @@ async def buy_code_preview(message: types.Message, state: FSMContext):
 
 
 async def process_purchase(user_id: int, game_key: str, names: list[str]) -> dict:
-    """Trừ tiền + tạo đơn trong 1 transaction (kiểm tra lại trùng & số dư)."""
     game = GAMES.get(game_key, GAMES["78win"])
     price = game["price"]
     result = "ok"
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            # Khóa toàn cục ngắn để tránh 2 người đăng ký trùng 1 tài khoản cùng lúc
             await conn.execute("SELECT pg_advisory_xact_lock(78001)")
             row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1 FOR UPDATE", user_id)
             bal = int(row["balance"]) if row else 0
@@ -1070,7 +1056,7 @@ async def order_confirm(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     names = data.get("names")
     game_key = data.get("game", "78win")
-    await state.clear()  # chống bấm xác nhận 2 lần
+    await state.clear()
     if not names:
         await edit_or_send(call, f"{e('no')} Phiên mua hàng đã hết hạn, vui lòng bấm <b>{BTN_CODE}</b> để mua lại.")
         await call.answer()
@@ -1198,7 +1184,6 @@ async def admin_add_money(message: types.Message):
 
 @dp.message(Command("hoan"))
 async def admin_refund_money(message: types.Message):
-    """Hoàn tiền (không tính vào tổng tiền đã nạp): /hoan <user_id> <so_tien>"""
     if message.from_user.id != ADMIN_ID:
         return
     try:
@@ -1237,7 +1222,6 @@ async def admin_sub_money(message: types.Message):
 
 @dp.message(Command("huy"))
 async def admin_cancel_order(message: types.Message):
-    """Admin hủy đơn đang chờ nhập code của 1 tài khoản game: /huy <ten_tai_khoan>"""
     if message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=1)
@@ -1290,18 +1274,77 @@ async def admin_stats(message: types.Message):
 
 
 # =====================================================================
-# LỌC CODE & TỰ ĐỘNG NHẬP WEB + GIẢI CAPTCHA
+# LỌC CODE 6 KÝ TỰ (TIN NHẮN & VIDEO)
 # =====================================================================
 def extract_clean_codes(raw_text: str) -> list[str]:
+    """
+    Lọc các chuỗi code có ký tự rác xen kẽ (ví dụ NrTs.WA@, hfAh!RE#, uJRJ.RC@),
+    xóa hết ký tự đặc biệt / gạch ngang / gạch chéo, chỉ giữ lại chữ hoa, chữ thường và số
+    có độ dài đúng 6 ký tự.
+    """
     clean_codes = []
-    for w in raw_text.split():
+    for w in (raw_text or "").split():
         if w.startswith(("http", "#", "@")):
             continue
+        # Chỉ nhận các cụm có chứa ký tự đặc biệt xen kẽ chữ/số (tránh nhận nhầm chữ bình thường như 'TẶNG', 'MỖI')
         if re.search(r"[^a-zA-Z0-9]", w) and re.search(r"[a-zA-Z0-9]", w):
             cleaned = re.sub(r"[^a-zA-Z0-9]", "", w)
-            if 5 <= len(cleaned) <= 12:
+            if len(cleaned) == 6:
                 clean_codes.append(cleaned)
     return list(dict.fromkeys(clean_codes))
+
+
+def _ocr_video_frame_sync(img_path: str) -> str:
+    """Cắt vùng bên trái video (nơi hiển thị dãy code) và tăng tương phản để OCR đọc chuẩn."""
+    with Image.open(img_path) as im:
+        im = im.convert("L")
+        w, h = im.size
+        # Cắt 45% bên trái màn hình video, bỏ 15% mép trên và 18% mép dưới (banner chữ vàng)
+        crop_box = (0, int(h * 0.15), int(w * 0.45), int(h * 0.82))
+        cropped = im.crop(crop_box)
+        cw, ch = cropped.size
+        cropped = cropped.resize((cw * 2, ch * 2), Image.Resampling.LANCZOS)
+        cropped = ImageEnhance.Contrast(cropped).enhance(2.2)
+
+        # Cắt ngang làm 5 dải để ddddocr đọc từng dòng code chính xác hơn
+        lines_text = []
+        step = ch * 2 // 5
+        for i in range(5):
+            strip = cropped.crop((0, i * step, cw * 2, (i + 1) * step))
+            buf = BytesIO()
+            strip.save(buf, format="PNG")
+            txt = ocr.classification(buf.getvalue())
+            if txt:
+                lines_text.append(txt)
+        return " ".join(lines_text)
+
+
+def _extract_codes_from_video_file(video_path: str, temp_dir: str) -> list[str]:
+    """Dùng ffmpeg trích xuất khung hình mỗi 1 giây và quét code 6 ký tự."""
+    frame_pattern = os.path.join(temp_dir, "frame_%03d.png")
+    subprocess.run(
+        ["ffmpeg", "-i", video_path, "-vf", "fps=1", "-vframes", "25", frame_pattern],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    found_codes = []
+    for frame_file in sorted(glob.glob(os.path.join(temp_dir, "frame_*.png"))):
+        raw_ocr = _ocr_video_frame_sync(frame_file)
+        for c in extract_clean_codes(raw_ocr):
+            if c not in found_codes:
+                found_codes.append(c)
+    return found_codes
+
+
+async def extract_codes_from_video_message(message) -> list[str]:
+    """Tải video từ Telegram về thư mục tạm, tách khung hình và lọc code 6 ký tự."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        video_path = os.path.join(tmpdir, "code_video.mp4")
+        await message.download_media(file=video_path)
+        if not os.path.exists(video_path):
+            return []
+        return await asyncio.to_thread(_extract_codes_from_video_file, video_path, tmpdir)
 
 
 def _ocr_sync(img_bytes: bytes) -> str:
@@ -1332,7 +1375,6 @@ async def refresh_captcha_image(page, captcha_img, captcha_input):
 
 
 async def get_page_notice(page) -> str:
-    """Lấy thông báo web trả về (để ghi chú gửi admin)."""
     try:
         for sel in ('[role="alert"]', ".swal2-html-container", ".toast", ".alert", ".notification"):
             loc = page.locator(sel)
@@ -1347,7 +1389,6 @@ async def get_page_notice(page) -> str:
 
 
 async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 4) -> tuple[str, str]:
-    """Trả về (trạng_thái, ghi_chú). Trạng thái: SUCCESS | FAIL."""
     await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
     await page.fill('input[placeholder*="Nhập code"]', code)
     await page.fill('input[placeholder*="Nhập tài khoản"]', game_username)
@@ -1388,7 +1429,6 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
 
 
 async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, ok: bool, note: str):
-    """Gửi admin kết quả MỖI LẦN nhập code (thành công hay thất bại)."""
     head = (
         f"{e('ok')} <b>NHẬP CODE THÀNH CÔNG</b>" if ok else f"{e('no')} <b>NHẬP CODE THẤT BẠI</b>"
     )
@@ -1427,8 +1467,69 @@ async def chay_nhap_code_cho_tai_khoan(codes: list[str], game_username: str, own
             await browser.close()
 
 
+async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
+    """Gửi bộ code vừa quét được (từ tin nhắn hoặc video) vào tất cả tài khoản đang chờ."""
+    if not codes:
+        return
+
+    try:
+        code_list_str = ", ".join(f"<code>{escape(c)}</code>" for c in codes)
+        await bot.send_message(
+            ADMIN_ID,
+            f"{e('fast')} <b>QUÉT ĐƯỢC CODE MỚI ({escape(source_label)})</b>\n"
+            f"{SEP}\n"
+            f"{e('new')} Danh sách ({len(codes)} mã): {code_list_str}",
+        )
+    except Exception:
+        pass
+
+    async with db_pool.acquire() as conn:
+        accounts = await conn.fetch(
+            "SELECT id, user_id, game_username FROM hunt_accounts WHERE status = 'active'"
+        )
+
+    for acc in accounts:
+        record_id = acc["id"]
+        owner_id = acc["user_id"]
+        game_user = acc["game_username"]
+
+        try:
+            won_code = await chay_nhap_code_cho_tai_khoan(codes, game_user, owner_id)
+            if won_code:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE hunt_accounts SET status = 'done' WHERE id = $1 AND status = 'active'",
+                        record_id,
+                    )
+                msg = (
+                    f"{e('fire')} <b>NHẬP CODE THÀNH CÔNG!</b> {e('top')}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"{e('pc')} Tài khoản: <code>{escape(game_user)}</code>\n"
+                    f"{e('new')} Mã code: <code>{escape(won_code)}</code>"
+                )
+                if owner_id != ADMIN_ID:
+                    await bot.send_message(owner_id, msg)
+            else:
+                await bot.send_message(
+                    owner_id,
+                    f"{e('soon')} Đợt code hiện tại chưa khớp cho <code>{escape(game_user)}</code>.\n"
+                    f"{e('reload')} Hệ thống tiếp tục giữ tài khoản ở trạng thái "
+                    f"<b>đang chờ nhập code</b> cho đợt code tiếp theo.",
+                )
+        except Exception as ex:
+            print(f"Lỗi nhập code cho {game_user}: {ex}")
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"{e('no')} <b>LỖI HỆ THỐNG</b> khi nhập code cho <code>{escape(game_user)}</code>:\n"
+                    f"<code>{escape(str(ex))}</code>",
+                )
+            except Exception:
+                pass
+
+
 # =====================================================================
-# QUÉT NHÓM LIÊN TỤC
+# QUÉT NHÓM LIÊN TỤC (TIN NHẮN + VIDEO)
 # =====================================================================
 async def start_scanner(session_str: str):
     global userbot
@@ -1437,55 +1538,26 @@ async def start_scanner(session_str: str):
 
     userbot = TelegramClient(StringSession(session_str), API_ID, API_HASH)
 
-    @userbot.on(events.NewMessage(chats=TARGET_GROUPS))
-    async def scanner_handler(event):
-        codes = extract_clean_codes(event.raw_text)
-        if not codes:
+    # 1. Nhóm FreeCode_78win -> Chỉ quét video gửi lên
+    @userbot.on(events.NewMessage(chats=VIDEO_TARGET_GROUPS))
+    async def video_scanner_handler(event):
+        if not event.message or not event.message.video:
             return
+        try:
+            codes = await extract_codes_from_video_message(event.message)
+            if codes:
+                await dispatch_codes_to_accounts(codes, "Video FreeCode_78win")
+        except Exception as ex:
+            print(f"Lỗi quét video FreeCode_78win: {ex}")
 
-        async with db_pool.acquire() as conn:
-            accounts = await conn.fetch(
-                "SELECT id, user_id, game_username FROM hunt_accounts WHERE status = 'active'"
-            )
-
-        for acc in accounts:
-            record_id = acc["id"]
-            owner_id = acc["user_id"]
-            game_user = acc["game_username"]
-
-            try:
-                won_code = await chay_nhap_code_cho_tai_khoan(codes, game_user, owner_id)
-                if won_code:
-                    async with db_pool.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE hunt_accounts SET status = 'done' WHERE id = $1 AND status = 'active'",
-                            record_id,
-                        )
-                    msg = (
-                        f"{e('fire')} <b>NHẬP CODE THÀNH CÔNG!</b> {e('top')}\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"{e('pc')} Tài khoản: <code>{escape(game_user)}</code>\n"
-                        f"{e('new')} Mã code: <code>{escape(won_code)}</code>"
-                    )
-                    if owner_id != ADMIN_ID:
-                        await bot.send_message(owner_id, msg)
-                else:
-                    await bot.send_message(
-                        owner_id,
-                        f"{e('soon')} Đợt code hiện tại chưa khớp cho <code>{escape(game_user)}</code>.\n"
-                        f"{e('reload')} Hệ thống tiếp tục giữ tài khoản ở trạng thái "
-                        f"<b>đang chờ nhập code</b> cho đợt code tiếp theo.",
-                    )
-            except Exception as ex:
-                print(f"Lỗi nhập code cho {game_user}: {ex}")
-                try:
-                    await bot.send_message(
-                        ADMIN_ID,
-                        f"{e('no')} <b>LỖI HỆ THỐNG</b> khi nhập code cho <code>{escape(game_user)}</code>:\n"
-                        f"<code>{escape(str(ex))}</code>",
-                    )
-                except Exception:
-                    pass
+    # 2. Nhóm official78wins -> Chỉ quét tin nhắn văn bản
+    @userbot.on(events.NewMessage(chats=TEXT_TARGET_GROUPS))
+    async def text_scanner_handler(event):
+        if not event.raw_text:
+            return
+        codes = extract_clean_codes(event.raw_text)
+        if codes:
+            await dispatch_codes_to_accounts(codes, "Tin nhắn official78wins")
 
     await userbot.connect()
     if await userbot.is_user_authorized():
