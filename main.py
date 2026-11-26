@@ -1438,9 +1438,7 @@ async def admin_check_web(message: types.Message, state: FSMContext):
                     elapsed_ms = int((time.perf_counter() - t0) * 1000)
                     has_code = await pg.locator('input[placeholder*="Nhập code"]').count() > 0
                     has_user = await pg.locator('input[placeholder*="Nhập tài khoản"]').count() > 0
-                    has_btn = await pg.locator(
-                        'button, [role="button"], input[type="submit"], a'
-                    ).filter(has_text=re.compile(r"kiểm tra", re.I)).count() > 0
+                    has_btn = await _has_text_button(pg, r"kiểm tra")
                     await status_msg.edit_text(
                         f"{e('ok')} <b>TRUY CẬP WEB THÀNH CÔNG</b> ({elapsed_ms} ms)\n"
                         f"{SEP}\n"
@@ -1458,9 +1456,7 @@ async def admin_check_web(message: types.Message, state: FSMContext):
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         has_code = await page.locator('input[placeholder*="Nhập code"]').count() > 0
         has_user = await page.locator('input[placeholder*="Nhập tài khoản"]').count() > 0
-        has_btn = await page.locator(
-            'button, [role="button"], input[type="submit"], a'
-        ).filter(has_text=re.compile(r"kiểm tra", re.I)).count() > 0
+        has_btn = await _has_text_button(page, r"kiểm tra")
         ready_tabs = _tab_queue.qsize() if _tab_queue else 0
 
         await status_msg.edit_text(
@@ -1700,6 +1696,62 @@ async def doc_captcha(img_bytes: bytes) -> str:
     return await asyncio.to_thread(_ocr_sync, img_bytes)
 
 
+# =====================================================================
+# THAO TÁC TRÊN TRANG WEB NHẬP CODE
+# =====================================================================
+async def click_text_button(page, pattern: str, below=None) -> bool:
+    """Bấm phần tử có chữ/alt/title khớp pattern; nếu có `below` thì chỉ nhận phần tử nằm dưới ô đó."""
+    rx = re.compile(pattern, re.I)
+    min_y = 0
+    if below is not None:
+        box = await below.bounding_box()
+        if box:
+            min_y = box["y"] + box["height"] - 5
+
+    finders = [
+        page.get_by_role("button", name=rx),
+        page.get_by_text(rx),
+        page.get_by_alt_text(rx),
+        page.get_by_title(rx),
+    ]
+    for loc in finders:
+        try:
+            total = await loc.count()
+        except Exception:
+            continue
+        for i in range(total):
+            el = loc.nth(i)
+            try:
+                if not await el.is_visible():
+                    continue
+                await el.scroll_into_view_if_needed(timeout=2000)
+                box = await el.bounding_box()
+                if not box or box["y"] < min_y:
+                    continue
+                await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+async def _has_text_button(page, pattern: str) -> bool:
+    """Kiểm tra có phần tử (nút/ảnh/chữ) khớp pattern trên trang hay không (dùng cho /checkweb)."""
+    rx = re.compile(pattern, re.I)
+    for loc in (
+        page.get_by_role("button", name=rx),
+        page.get_by_text(rx),
+        page.get_by_alt_text(rx),
+        page.get_by_title(rx),
+    ):
+        try:
+            if await loc.count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def refresh_captcha_image(page, captcha_img, captcha_input):
     refresh_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
         has_text=re.compile(r"làm mới", re.I)
@@ -1709,12 +1761,8 @@ async def refresh_captcha_image(page, captcha_img, captcha_input):
     else:
         await captcha_img.click()
     await page.wait_for_timeout(1000)
-    if not await captcha_input.is_visible():
-        check_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
-            has_text=re.compile(r"kiểm tra", re.I)
-        ).first
-        await check_btn.click(timeout=10000)
-        await captcha_input.wait_for(state="visible", timeout=8000)
+    if not await captcha_input.first.is_visible():
+        return
 
 
 def _format_notice_lines(raw_text: str) -> str:
@@ -1766,58 +1814,65 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
     clean_code = clean_text(code)
     clean_user = clean_text(game_username)
 
-    if page.url.rstrip("/") != TARGET_URL.rstrip("/"):
-        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=15000)
-
     code_input = page.locator('input[placeholder*="Nhập code"]')
     user_input = page.locator('input[placeholder*="Nhập tài khoản"]')
-    if await code_input.count() == 0 or await user_input.count() == 0:
-        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=15000)
-
-    await page.fill('input[placeholder*="Nhập code"]', clean_code)
-    await page.fill('input[placeholder*="Nhập tài khoản"]', clean_user)
-
-    check_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
-        has_text=re.compile(r"kiểm tra", re.I)
-    ).first
-    await check_btn.click(timeout=12000)
-
     captcha_input = page.locator('input[placeholder*="Nhập mã captcha"]')
-    await captcha_input.wait_for(state="visible", timeout=8000)
+
+    if page.url.rstrip("/") != TARGET_URL.rstrip("/") or await code_input.count() == 0:
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=15000)
+    await code_input.first.wait_for(state="visible", timeout=8000)
+
+    # Đóng popup cũ nếu còn
+    try:
+        old_close = page.get_by_text(re.compile(r"^\s*đóng\s*$", re.I))
+        if await old_close.count() > 0 and await old_close.first.is_visible():
+            await old_close.first.click(timeout=2000)
+    except Exception:
+        pass
+
+    # BƯỚC 1: điền code + tài khoản
+    await code_input.first.fill(clean_code)
+    await user_input.first.fill(clean_user)
+
+    # BƯỚC 2: bấm KIỂM TRA (nút nằm dưới ô tài khoản)
+    if not await click_text_button(page, r"kiểm tra", below=user_input.first):
+        return "FAIL", "Không tìm thấy nút Kiểm tra trên web"
+
+    # BƯỚC 3: chờ ô captcha hiện ra
+    try:
+        await captcha_input.first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        notice = await get_page_notice(page)
+        return "FAIL", notice or "Bấm Kiểm tra nhưng web không hiện ô captcha"
 
     captcha_img = page.locator('img[src*="captcha"], canvas').first
     if await captcha_img.count() == 0:
         captcha_img = page.locator("img").nth(1)
 
+    # BƯỚC 4: giải captcha -> bấm XÁC THỰC
     for _ in range(max_captcha_retry):
         img_bytes = await captcha_img.screenshot()
         captcha_text = await doc_captcha(img_bytes)
-
         if not captcha_text:
             await refresh_captcha_image(page, captcha_img, captcha_input)
             continue
 
-        await captcha_input.fill(captcha_text)
-        verify_btn = page.locator('button, [role="button"], input[type="submit"], a').filter(
-            has_text=re.compile(r"xác thực", re.I)
-        ).first
-        await verify_btn.click(timeout=12000)
-        await page.wait_for_timeout(1200)
+        await captcha_input.first.fill(captcha_text)
+        if not await click_text_button(page, r"xác thực", below=captcha_input.first):
+            return "FAIL", "Không tìm thấy nút Xác thực trên web"
+        await page.wait_for_timeout(1500)
 
         notice = await get_page_notice(page)
-        body_text = (notice or (await page.inner_text("body"))).lower()
+        low = notice.lower()
 
-        if "thành công" in body_text or "nhận được" in body_text or "cộng" in body_text:
-            return "SUCCESS", notice or "Thành công"
-
-        if "captcha" in body_text or "mã xác thực" in body_text:
+        if "thành công" in low and "thất bại" not in low:
+            return "SUCCESS", notice
+        if "captcha" in low or "mã xác thực" in low:
             await refresh_captcha_image(page, captcha_img, captcha_input)
             continue
-
         return "FAIL", notice or "Không có phản hồi từ web"
 
-    notice = await get_page_notice(page)
-    return "FAIL", notice or f"Giải captcha sai sau {max_captcha_retry} lần thử"
+    return "FAIL", (await get_page_notice(page)) or f"Giải captcha sai sau {max_captcha_retry} lần"
 
 
 async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, ok: bool, note: str):
@@ -1845,8 +1900,16 @@ async def _run_codes_on_page(page, codes: list[str], game_username: str, owner_i
         try:
             status, note = await thu_mot_code(page, code, game_username)
         except Exception as ex:
-            first_line = (str(ex) or "").splitlines()[0]
-            status, note = "FAIL", clean_text(first_line) or "Lỗi thao tác trên trang web"
+            print(f"Lỗi Playwright: {ex}")  # chi tiết kỹ thuật chỉ ghi log
+            notice = ""
+            try:
+                notice = await get_page_notice(page)
+            except Exception:
+                pass
+            if notice:
+                status, note = "FAIL", notice
+            else:
+                status, note = "FAIL", "Lỗi thao tác trên trang web (không đọc được phản hồi)"
 
         ok = status == "SUCCESS"
         await report_attempt_to_admin(code, game_username, owner_id, ok, note)
