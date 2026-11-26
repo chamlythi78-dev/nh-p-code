@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 import asyncpg
 import ddddocr
 from PIL import Image, ImageEnhance
+import cairosvg
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -521,10 +522,26 @@ def _download_vietqr_image(url: str) -> bytes:
     if len(raw_data) > 5 * 1024 * 1024:
         raise ValueError("Ảnh QR tải về vượt quá giới hạn 5 MB")
 
-    # Không tin phần mở rộng hoặc Content-Type từ máy chủ; giải mã thật
-    # bằng Pillow rồi mã hóa lại thành PNG RGB sạch để Telegram xử lý.
+    # VietQR đôi khi trả SVG dù URL có đuôi .png. Render SVG thành PNG
+    # trước, sau đó dùng Pillow chuẩn hóa thành RGB để Telegram nhận ổn định.
+    image_bytes = raw_data
+    looks_like_svg = (
+        "image/svg" in content_type
+        or raw_data.lstrip().startswith(b"<svg")
+        or (raw_data.lstrip().startswith(b"<?xml") and b"<svg" in raw_data[:2048])
+    )
+    if looks_like_svg:
+        try:
+            image_bytes = cairosvg.svg2png(
+                bytestring=raw_data,
+                output_width=1080,
+                output_height=1280,
+            )
+        except Exception as exc:
+            raise ValueError(f"Không chuyển đổi được SVG VietQR sang PNG: {exc}") from exc
+
     try:
-        with Image.open(BytesIO(raw_data)) as source:
+        with Image.open(BytesIO(image_bytes)) as source:
             source.load()
             image = source.convert("RGB")
     except Exception as exc:
