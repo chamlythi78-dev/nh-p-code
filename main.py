@@ -1,9 +1,12 @@
 import asyncio
+import math
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from html import escape
 from io import BytesIO
+from urllib.parse import quote
 
 import asyncpg
 import ddddocr
@@ -11,6 +14,7 @@ from PIL import Image, ImageEnhance
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -32,7 +36,7 @@ API_ID = int(os.getenv("API_ID", "30309186"))
 API_HASH = os.getenv("API_HASH", "307273bc278e53017b5fdcd407c1d941")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "+84335442999")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9044293543:AAEFP_xv45GUuR76f382cekrDOaCjdE2zLw")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9044293543:AAFsfySOxWfONgQUOOrdAYHK87HfIYMaqhU")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "9220244280"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
@@ -40,6 +44,22 @@ TARGET_GROUPS = ["official78wins", "FreeCode_78win"]
 TARGET_URL = "https://code78k.online/"
 CODE_PRICE = 10000
 MAX_BATCH = 30  # số tài khoản tối đa đăng ký trong 1 lần
+ORDER_TIMEOUT_HOURS = 72  # quá hạn chưa nhập code -> tự huỷ + hoàn tiền
+PAGE_SIZE = 8  # số dòng mỗi trang (lịch sử / đơn hàng)
+
+# Hỗ trợ
+SUPPORT_GROUP = "khututricvx"
+SUPPORT_ADMIN = "dgfrutil"
+
+# Nạp tiền
+BANK_NAME = "KIENLONGBANK"
+BANK_CODE = "KLB"  # mã ngân hàng theo VietQR
+BANK_ACCOUNT_NAME = "BAN TIEN PHONG"
+BANK_ACCOUNT_NO = "6530052011"
+DEPOSIT_PREFIX = "nap tien code tu dong"  # 5 chữ + ID người dùng
+MIN_DEPOSIT = 10000
+MAX_DEPOSIT = 50_000_000
+QUICK_AMOUNTS = [10000, 20000, 50000, 100000, 500000, 1000000]
 
 VN_TZ = timezone(timedelta(hours=7))
 
@@ -49,33 +69,55 @@ GAMES = {
 }
 
 # =====================================================================
-# EMOJI PREMIUM
+# EMOJI PREMIUM  (tên: (id emoji premium, emoji dự phòng))
 # =====================================================================
-EMOJI = {
-    "ok": "5206607081334906820",       # ✔️
-    "fast": "5456140674028019486",     # ⚡️
-    "money": "5231449120635370684",    # 💸
-    "money2": "5231005931550030290",   # 💸
-    "no": "5210952531676504517",       # ❌
-    "fire": "5424972470023104089",     # 🔥
-    "reload": "5375338737028841420",   # 🔄
-    "top": "5341498088408234504",      # 💯
-    "new": "5382357040008021292",      # 🆕
-    "soon": "5440621591387980068",     # 🔜
-    "pc": "5282843764451195532",       # 🖥
-    "link": "5271604874419647061",     # 🔗
-    "shield": "5251203410396458957",   # 🛡
-    "plus": "5397916757333654639",     # ➕
-    "lock": "5296369303661067030",     # 🔒
-    "down": "5406745015365943482",     # ⬇️
-    "mail": "5253742260054409879",     # ✉️
+EMOJI_TABLE = {
+    "ok": ("5206607081334906820", "✔️"),
+    "no": ("5210952531676504517", "❌"),
+    "fast": ("5456140674028019486", "⚡️"),
+    "fire": ("5424972470023104089", "🔥"),
+    "money": ("5231449120635370684", "💸"),
+    "money2": ("5231005931550030290", "💸"),
+    "cash": ("5409048419211682843", "💵"),
+    "reload": ("5375338737028841420", "🔄"),
+    "shield": ("5251203410396458957", "🛡"),
+    "plus": ("5397916757333654639", "➕"),
+    "down": ("5406745015365943482", "⬇️"),
+    "new": ("5382357040008021292", "🆕"),
+    "gem": ("5427168083074628963", "💎"),
+    "game": ("5361741454685256344", "🎮"),
+    "hourglass": ("5386367538735104399", "⌛"),
+    "bulb": ("5422439311196834318", "💡"),
+    "gold": ("5440539497383087970", "🥇"),
+    "gift": ("5442939099906325301", "🎁"),
+    "bell": ("5440833702642857683", "🔔"),
+    "link": ("5440410042773824003", "🔗"),
+    "bank": ("5238132025323444613", "🏦"),
+    "card": ("5472250091332993630", "💳"),
+    "wallet": ("5215420556089776398", "👛"),
+    "receipt": ("5204242830687494041", "🧾"),
+    "rocket": ("5188481279963715781", "🚀"),
+    "trophy": ("5188344996356448758", "🏆"),
+    "phone": ("5213179235996294999", "📞"),
+    "mega": ("5298609030321691620", "📣"),
+    "warn": ("5447644880824181073", "⚠️"),
+    "pin": ("5397782960512444700", "📌"),
+    "chart": ("5244837092042750681", "📈"),
+    "coin": ("5382164415019768638", "🪙"),
+    "bag": ("5417924076503062111", "💰"),
+    "inbox": ("5443127283898405358", "📥"),
+    "globe": ("5447410659077661506", "🌐"),
+    "user": ("6066579956287148786", "👨‍💻"),
+    "up": ("5415655814079723871", "🔝"),
+    # các emoji cũ giữ nguyên
+    "top": ("5341498088408234504", "💯"),
+    "soon": ("5440621591387980068", "🔜"),
+    "pc": ("5282843764451195532", "🖥"),
+    "lock": ("5296369303661067030", "🔒"),
+    "mail": ("5253742260054409879", "✉️"),
 }
-FALLBACK = {
-    "ok": "✔️", "fast": "⚡️", "money": "💸", "money2": "💸", "no": "❌",
-    "fire": "🔥", "reload": "🔄", "top": "💯", "new": "🆕", "soon": "🔜",
-    "pc": "🖥", "link": "🔗", "shield": "🛡", "plus": "➕", "lock": "🔒",
-    "down": "⬇️", "mail": "✉️",
-}
+EMOJI = {k: v[0] for k, v in EMOJI_TABLE.items()}
+FALLBACK = {k: v[1] for k, v in EMOJI_TABLE.items()}
 
 
 def e(name: str) -> str:
@@ -91,6 +133,10 @@ def inline_btn(text: str, icon: str, callback_data: str) -> InlineKeyboardButton
     return InlineKeyboardButton(text=text, callback_data=callback_data, icon_custom_emoji_id=EMOJI[icon])
 
 
+def url_btn(text: str, icon: str, url: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, url=url, icon_custom_emoji_id=EMOJI[icon])
+
+
 # =====================================================================
 # KHỞI TẠO
 # =====================================================================
@@ -100,10 +146,14 @@ ocr = ddddocr.DdddOcr(show_ad=False)
 db_pool: asyncpg.Pool | None = None
 userbot: TelegramClient | None = None
 temp_login_client: TelegramClient | None = None
+background_tasks: list[asyncio.Task] = []
+paid_notify_at: dict[int, float] = {}  # chống spam nút "Đã chuyển khoản"
 
 
 class BotStates(StatesGroup):
     waiting_for_username = State()
+    confirm_order = State()
+    waiting_for_amount = State()
     waiting_for_otp = State()
     waiting_for_2fa = State()
 
@@ -111,28 +161,29 @@ class BotStates(StatesGroup):
 BTN_CODE = "Nhập Code"
 BTN_ACCOUNT = "Tài Khoản"
 BTN_DEPOSIT = "Nạp Tiền"
-MENU_TEXTS = (BTN_CODE, BTN_ACCOUNT, BTN_DEPOSIT)
+BTN_HISTORY = "Lịch Sử"
+BTN_ORDERS = "Đơn Hàng"
+BTN_SUPPORT = "Nhóm Hỗ Trợ"
+MENU_TEXTS = (BTN_CODE, BTN_ACCOUNT, BTN_DEPOSIT, BTN_HISTORY, BTN_ORDERS, BTN_SUPPORT)
 
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [kb_btn(BTN_CODE, "fire"), kb_btn(BTN_ACCOUNT, "shield")],
-        [kb_btn(BTN_DEPOSIT, "money")],
+        [kb_btn(BTN_CODE, "fire"), kb_btn(BTN_ACCOUNT, "user")],
+        [kb_btn(BTN_DEPOSIT, "money"), kb_btn(BTN_HISTORY, "receipt")],
+        [kb_btn(BTN_ORDERS, "gift"), kb_btn(BTN_SUPPORT, "shield")],
     ],
     resize_keyboard=True,
 )
 
-
-def game_select_kb() -> InlineKeyboardMarkup:
-    rows = [
-        [inline_btn(f"{g['name']}  •  {g['price']:,}đ", "top", f"game:{key}")]
-        for key, g in GAMES.items()
-    ]
-    rows.append([inline_btn("Hủy", "no", "game:cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+SEP = "━━━━━━━━━━━━━━━━━━"
 
 
 def now_str() -> str:
     return datetime.now(VN_TZ).strftime("%H:%M:%S %d/%m/%Y")
+
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.astimezone(VN_TZ).strftime("%H:%M %d/%m/%Y")
 
 
 # =====================================================================
@@ -150,6 +201,8 @@ async def init_db():
                 balance BIGINT DEFAULT 0
             )
         """)
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_deposit BIGINT DEFAULT 0")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ DEFAULT now()")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS hunt_accounts (
                 id SERIAL PRIMARY KEY,
@@ -159,12 +212,24 @@ async def init_db():
             )
         """)
         await conn.execute("ALTER TABLE hunt_accounts ADD COLUMN IF NOT EXISTS game TEXT DEFAULT '78win'")
+        await conn.execute("ALTER TABLE hunt_accounts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount BIGINT NOT NULL,
+                type TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions (user_id, id DESC)")
         # Chặn trùng ở tầng DB: 1 tài khoản game chỉ được có 1 đơn đang chờ
         try:
             await conn.execute("""
@@ -190,14 +255,30 @@ async def save_session(session_str: str):
         """, session_str)
 
 
-async def get_user_balance(user_id: int) -> int:
+async def get_user_info(user_id: int):
+    """Trả về record (balance, total_deposit, joined_at); tự tạo user nếu chưa có."""
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO users (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING",
             user_id,
         )
-        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
-        return int(row["balance"]) if row else 0
+        return await conn.fetchrow(
+            "SELECT balance, COALESCE(total_deposit, 0) AS total_deposit, joined_at FROM users WHERE user_id = $1",
+            user_id,
+        )
+
+
+async def get_user_balance(user_id: int) -> int:
+    info = await get_user_info(user_id)
+    return int(info["balance"]) if info else 0
+
+
+async def add_tx(conn, user_id: int, amount: int, tx_type: str, note: str = ""):
+    """Ghi 1 dòng lịch sử giao dịch (amount dương = cộng, âm = trừ)."""
+    await conn.execute(
+        "INSERT INTO transactions (user_id, amount, type, note) VALUES ($1, $2, $3, $4)",
+        user_id, amount, tx_type, note,
+    )
 
 
 # =====================================================================
@@ -273,86 +354,423 @@ async def admin_login_2fa(message: types.Message, state: FSMContext):
 
 
 # =====================================================================
+# TIỆN ÍCH GIAO DIỆN
+# =====================================================================
+async def edit_or_send(call: types.CallbackQuery, text: str, kb: InlineKeyboardMarkup | None = None):
+    """Sửa tin nhắn hiện tại; nếu không sửa được (tin ảnh QR, không đổi...) thì gửi tin mới."""
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
+
+
+def home_text(bal: int) -> str:
+    return (
+        f"{e('fire')} <b>HỆ THỐNG NHẬP CODE TỰ ĐỘNG</b> {e('fast')}\n"
+        f"{SEP}\n"
+        f"{e('wallet')} Số dư: <b>{bal:,}đ</b>\n"
+        f"{e('top')} Giá đăng ký: <b>{CODE_PRICE:,}đ / tài khoản</b>\n"
+        f"{SEP}\n"
+        f"{e('down')} Chọn chức năng ở menu bên dưới"
+    )
+
+
+def page_kb(prefix: str, page: int, pages: int) -> InlineKeyboardMarkup:
+    nav = []
+    if page > 0:
+        nav.append(inline_btn("Trước", "reload", f"{prefix}:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(inline_btn("Sau", "down", f"{prefix}:{page + 1}"))
+    rows = [nav] if pages > 1 else []
+    rows.append([inline_btn("Nạp Tiền", "money", "dep:menu"), inline_btn("Menu Chính", "up", "home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(call: types.CallbackQuery):
+    await call.answer()
+
+
+@dp.callback_query(F.data == "home")
+async def cb_home(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    bal = await get_user_balance(call.from_user.id)
+    await call.message.answer(home_text(bal), reply_markup=main_kb)
+    await call.answer()
+
+
+# =====================================================================
 # NGƯỜI DÙNG
 # =====================================================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     bal = await get_user_balance(message.from_user.id)
-    await message.answer(
-        f"{e('fire')} <b>HỆ THỐNG NHẬP CODE TỰ ĐỘNG</b> {e('fast')}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{e('money')} Số dư: <b>{bal:,}đ</b>\n"
-        f"{e('top')} Giá đăng ký: <b>{CODE_PRICE:,}đ / tài khoản</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{e('down')} Chọn chức năng ở menu bên dưới",
-        reply_markup=main_kb,
-    )
+    await message.answer(home_text(bal), reply_markup=main_kb)
 
 
 # ---- Tài Khoản -------------------------------------------------------
+async def build_account(user: types.User):
+    info = await get_user_info(user.id)
+    name = escape(user.full_name or "—")
+    uname = f"@{escape(user.username)}" if user.username else "Chưa đặt"
+    joined = info["joined_at"].astimezone(VN_TZ).strftime("%Y-%m-%d %H:%M:%S") if info["joined_at"] else "—"
+    text = (
+        f"{e('user')} <b>THÔNG TIN TÀI KHOẢN &amp; VÍ TIỀN</b>\n"
+        f"\n"
+        f"{e('link')} <b>Telegram ID:</b> <code>{user.id}</code>\n"
+        f"{e('gold')} <b>Tên tài khoản:</b> {name}\n"
+        f"{e('pin')} <b>Username:</b> {uname}\n"
+        f"\n"
+        f"{e('wallet')} <b>Số dư khả dụng:</b> <code>{int(info['balance']):,} VNĐ</code>\n"
+        f"{e('cash')} <b>Tổng tiền đã nạp:</b> <code>{int(info['total_deposit']):,} VNĐ</code>\n"
+        f"{e('hourglass')} <b>Ngày tham gia:</b> {joined}\n"
+        f"\n"
+        f"{e('bulb')} <i>Bấm 'Nạp Tiền' bên dưới để nạp thêm số dư nhanh chóng!</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [inline_btn("Nạp Tiền", "money", "dep:menu"), inline_btn("Lịch Sử GD", "receipt", "hist:0")],
+        [inline_btn("Menu Chính", "up", "home")],
+    ])
+    return text, kb
+
+
 @dp.message(F.text == BTN_ACCOUNT)
 async def menu_account(message: types.Message, state: FSMContext):
     await state.clear()
-    uid = message.from_user.id
-    bal = await get_user_balance(uid)
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT game_username, status, game FROM hunt_accounts "
-            "WHERE user_id = $1 ORDER BY id DESC LIMIT 30",
-            uid,
-        )
-
-    lines = [
-        f"{e('shield')} <b>THÔNG TIN TÀI KHOẢN</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        f"{e('link')} ID của bạn: <code>{uid}</code>",
-        f"{e('money')} Số dư: <b>{bal:,}đ</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        f"{e('pc')} <b>Danh sách tài khoản (30 gần nhất):</b>",
-    ]
-    if not rows:
-        lines.append(f"{e('no')} Chưa có tài khoản nào đang chờ nhập code.")
-    else:
-        for idx, r in enumerate(rows, 1):
-            game_name = GAMES.get(r["game"] or "78win", {}).get("name", "78WIN")
-            if r["status"] == "active":
-                status = f"{e('reload')} Đang chờ nhập code"
-            elif r["status"] == "cancelled":
-                status = f"{e('no')} Đã bị Admin hủy"
-            else:
-                status = f"{e('ok')} Đã nhập code thành công"
-            lines.append(f"{idx}. <code>{escape(r['game_username'])}</code> • {game_name} • {status}")
-    await message.answer("\n".join(lines))
+    text, kb = await build_account(message.from_user)
+    await message.answer(text, reply_markup=kb)
 
 
 # ---- Nạp Tiền --------------------------------------------------------
+def amount_label(amount: int) -> str:
+    if amount >= 1_000_000 and amount % 1_000_000 == 0:
+        return f"{amount // 1_000_000}M"
+    return f"{amount // 1000}K"
+
+
+def deposit_menu_content(bal: int):
+    text = (
+        f"{e('money2')} <b>NẠP TIỀN VÀO VÍ</b>\n"
+        f"{SEP}\n"
+        f"{e('wallet')} Số dư hiện tại: <b>{bal:,}đ</b>\n"
+        f"{SEP}\n"
+        f"{e('fast')} Chọn nhanh số tiền bên dưới hoặc bấm <b>Nhập số tiền khác</b>.\n"
+        f"{e('card')} Bot sẽ tạo <b>mã QR</b> có sẵn số tiền &amp; nội dung chuyển khoản.\n"
+        f"{e('warn')} Tối thiểu <b>{MIN_DEPOSIT:,}đ</b>."
+    )
+    rows, row = [], []
+    for amt in QUICK_AMOUNTS:
+        row.append(inline_btn(amount_label(amt), "money", f"dep:{amt}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([inline_btn("Nhập số tiền khác", "plus", "dep:custom")])
+    rows.append([inline_btn("Menu Chính", "up", "home")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(F.text == BTN_DEPOSIT)
 async def menu_deposit(message: types.Message, state: FSMContext):
     await state.clear()
     bal = await get_user_balance(message.from_user.id)
+    text, kb = deposit_menu_content(bal)
+    await message.answer(text, reply_markup=kb)
+
+
+def parse_amount(raw: str) -> int | None:
+    """Hiểu: 50000, 50.000, 50,000, 50k, 1m, 1.5m, 2tr ..."""
+    s = (raw or "").strip().lower().replace(" ", "").replace("đ", "").replace("vnd", "")
+    m = re.fullmatch(r"(\d+(?:[.,]\d+)?)(k|m|tr|nghin|ngan)?", s)
+    if not m:
+        return None
+    num, suffix = m.group(1), m.group(2)
+    if suffix:
+        mult = 1000 if suffix in ("k", "nghin", "ngan") else 1_000_000
+        return int(round(float(num.replace(",", ".")) * mult))
+    digits = re.sub(r"[.,]", "", num)
+    return int(digits) if digits.isdigit() else None
+
+
+def vietqr_url(amount: int, content: str) -> str:
+    return (
+        f"https://img.vietqr.io/image/{BANK_CODE}-{BANK_ACCOUNT_NO}-compact2.png"
+        f"?amount={amount}&addInfo={quote(content)}&accountName={quote(BANK_ACCOUNT_NAME)}"
+    )
+
+
+async def send_deposit_qr(target: types.Message, uid: int, amount: int):
+    content = f"{DEPOSIT_PREFIX} {uid}"
+    caption = (
+        f"{e('card')} <b>THÔNG TIN NẠP TIỀN</b>\n"
+        f"{SEP}\n"
+        f"{e('bank')} Ngân hàng: <b>{BANK_NAME}</b>\n"
+        f"{e('user')} Chủ tài khoản: <b>{BANK_ACCOUNT_NAME}</b>\n"
+        f"{e('link')} Số tài khoản: <code>{BANK_ACCOUNT_NO}</code>\n"
+        f"{e('money')} Số tiền: <b>{amount:,}đ</b>\n"
+        f"{e('pin')} Nội dung: <code>{escape(content)}</code>\n"
+        f"{SEP}\n"
+        f"{e('fast')} Quét mã QR để tự điền sẵn <b>số tiền &amp; nội dung</b>.\n"
+        f"{e('warn')} Giữ <b>đúng nội dung chuyển khoản</b> để được cộng tiền.\n"
+        f"{e('hourglass')} Chuyển xong bấm <b>Đã chuyển khoản</b> để báo Admin cộng tiền."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [inline_btn("Đã chuyển khoản", "ok", f"dep:paid:{amount}")],
+        [inline_btn("Đổi số tiền", "reload", "dep:menu"), inline_btn("Menu Chính", "up", "home")],
+    ])
+    try:
+        await target.answer_photo(photo=vietqr_url(amount, content), caption=caption, reply_markup=kb)
+    except Exception as ex:
+        print(f"Không gửi được ảnh QR: {ex}")
+        await target.answer(
+            caption + f"\n{e('no')} <i>Không tải được ảnh QR, vui lòng chuyển khoản thủ công theo thông tin trên.</i>",
+            reply_markup=kb,
+        )
+
+
+@dp.callback_query(F.data.startswith("dep:"))
+async def cb_deposit(call: types.CallbackQuery, state: FSMContext):
+    parts = call.data.split(":")
+    action = parts[1]
+    uid = call.from_user.id
+
+    if action == "menu":
+        await state.clear()
+        bal = await get_user_balance(uid)
+        text, kb = deposit_menu_content(bal)
+        await edit_or_send(call, text, kb)
+        await call.answer()
+        return
+
+    if action == "custom":
+        await state.set_state(BotStates.waiting_for_amount)
+        await edit_or_send(
+            call,
+            f"{e('plus')} <b>NHẬP SỐ TIỀN NẠP</b>\n"
+            f"{SEP}\n"
+            f"{e('money')} Tối thiểu <b>{MIN_DEPOSIT:,}đ</b>, tối đa <b>{MAX_DEPOSIT:,}đ</b>.\n"
+            f"{e('mail')} Gửi số tiền muốn nạp, ví dụ: <code>75000</code> hoặc <code>75k</code>",
+            InlineKeyboardMarkup(inline_keyboard=[[inline_btn("Quay lại", "reload", "dep:menu")]]),
+        )
+        await call.answer()
+        return
+
+    if action == "paid":
+        try:
+            amount = int(parts[2])
+        except (IndexError, ValueError):
+            await call.answer()
+            return
+        last = paid_notify_at.get(uid, 0)
+        if time.time() - last < 60:
+            await call.answer("Đã gửi yêu cầu rồi, vui lòng chờ Admin xử lý.", show_alert=True)
+            return
+        paid_notify_at[uid] = time.time()
+        u = call.from_user
+        uname = f"@{escape(u.username)}" if u.username else "không có"
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"{e('bell')} <b>YÊU CẦU XÁC NHẬN NẠP TIỀN</b>\n"
+                f"{SEP}\n"
+                f"{e('user')} Khách: {escape(u.full_name or '')} ({uname})\n"
+                f"{e('link')} ID: <code>{u.id}</code>\n"
+                f"{e('money')} Số tiền: <b>{amount:,}đ</b>\n"
+                f"{e('pin')} Nội dung: <code>{escape(DEPOSIT_PREFIX)} {u.id}</code>\n"
+                f"{e('soon')} Thời gian: {now_str()}\n"
+                f"{SEP}\n"
+                f"Sau khi kiểm tra tiền về: <code>/nap {u.id} {amount}</code>",
+            )
+        except Exception as ex:
+            print(f"Không báo được admin: {ex}")
+        await call.answer("Đã gửi yêu cầu cho Admin, tiền sẽ được cộng sau khi kiểm tra.", show_alert=True)
+        return
+
+    # dep:<so_tien>
+    try:
+        amount = int(action)
+    except ValueError:
+        await call.answer()
+        return
+    if not MIN_DEPOSIT <= amount <= MAX_DEPOSIT:
+        await call.answer("Số tiền không hợp lệ!", show_alert=True)
+        return
+    await state.clear()
+    await send_deposit_qr(call.message, uid, amount)
+    await call.answer()
+
+
+@dp.message(BotStates.waiting_for_amount)
+async def deposit_custom_amount(message: types.Message, state: FSMContext):
+    raw = message.text or ""
+    if raw.strip().startswith("/"):
+        await message.answer(f"{e('no')} Số tiền không hợp lệ, nhập lại (ví dụ <code>75000</code>):")
+        return
+    amount = parse_amount(raw)
+    if amount is None:
+        await message.answer(f"{e('no')} Số tiền không hợp lệ, nhập lại (ví dụ <code>75000</code> hoặc <code>75k</code>):")
+        return
+    if amount < MIN_DEPOSIT:
+        await message.answer(f"{e('no')} Nạp tối thiểu <b>{MIN_DEPOSIT:,}đ</b>, nhập lại:")
+        return
+    if amount > MAX_DEPOSIT:
+        await message.answer(f"{e('no')} Nạp tối đa <b>{MAX_DEPOSIT:,}đ</b> mỗi lần, nhập lại:")
+        return
+    await state.clear()
+    await send_deposit_qr(message, message.from_user.id, amount)
+
+
+# ---- Lịch Sử ---------------------------------------------------------
+TX_LABELS = {
+    "deposit": "Nạp tiền",
+    "purchase": "Mua slot nhập code",
+    "refund": "Hoàn tiền",
+    "admin_sub": "Admin trừ tiền",
+}
+
+
+async def build_history(uid: int, page: int):
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM transactions WHERE user_id = $1", uid)
+        pages = max(1, math.ceil(total / PAGE_SIZE))
+        page = max(0, min(page, pages - 1))
+        rows = await conn.fetch(
+            "SELECT amount, type, note, created_at FROM transactions WHERE user_id = $1 "
+            "ORDER BY id DESC LIMIT $2 OFFSET $3",
+            uid, PAGE_SIZE, page * PAGE_SIZE,
+        )
+    lines = [
+        f"{e('receipt')} <b>LỊCH SỬ GIAO DỊCH</b>",
+        f"{SEP}",
+    ]
+    if not rows:
+        lines.append(f"{e('no')} Bạn chưa có giao dịch nào.")
+    else:
+        lines.append(f"{e('chart')} Tổng cộng <b>{total}</b> giao dịch")
+        lines.append("")
+        for r in rows:
+            amt = int(r["amount"])
+            icon = e("plus") if amt >= 0 else e("down")
+            sign = "+" if amt >= 0 else "-"
+            label = TX_LABELS.get(r["type"], r["type"])
+            note = f" · {escape(r['note'])}" if r["note"] else ""
+            lines.append(f"{icon} <b>{sign}{abs(amt):,}đ</b> · {label}")
+            lines.append(f"┗ {fmt_dt(r['created_at'])}{note}")
+    return "\n".join(lines), page_kb("hist", page, pages)
+
+
+@dp.message(F.text == BTN_HISTORY)
+async def menu_history(message: types.Message, state: FSMContext):
+    await state.clear()
+    text, kb = await build_history(message.from_user.id, 0)
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("hist:"))
+async def cb_history(call: types.CallbackQuery):
+    page = int(call.data.split(":")[1])
+    text, kb = await build_history(call.from_user.id, page)
+    await edit_or_send(call, text, kb)
+    await call.answer()
+
+
+# ---- Đơn Hàng --------------------------------------------------------
+async def build_orders(uid: int, page: int):
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM hunt_accounts WHERE user_id = $1 AND status = 'active'", uid
+        )
+        pages = max(1, math.ceil(total / PAGE_SIZE))
+        page = max(0, min(page, pages - 1))
+        rows = await conn.fetch(
+            "SELECT game_username, game, created_at FROM hunt_accounts "
+            "WHERE user_id = $1 AND status = 'active' ORDER BY id DESC LIMIT $2 OFFSET $3",
+            uid, PAGE_SIZE, page * PAGE_SIZE,
+        )
+    lines = [
+        f"{e('gift')} <b>ĐƠN HÀNG ĐANG CHỜ NHẬP CODE</b>",
+        f"{SEP}",
+    ]
+    if not rows:
+        lines.append(f"{e('no')} Bạn chưa có đơn hàng nào đang chờ nhập code.")
+        lines.append(f"{e('fire')} Bấm <b>{BTN_CODE}</b> để mua slot nhập code.")
+    else:
+        lines.append(f"{e('reload')} Đang chờ: <b>{total}</b> đơn")
+        lines.append("")
+        now = datetime.now(timezone.utc)
+        for idx, r in enumerate(rows, page * PAGE_SIZE + 1):
+            game_name = GAMES.get(r["game"] or "78win", {}).get("name", "78WIN")
+            created = r["created_at"] or now
+            remain = created + timedelta(hours=ORDER_TIMEOUT_HOURS) - now
+            mins = max(0, int(remain.total_seconds() // 60))
+            lines.append(f"{e('reload')} <b>{idx}.</b> <code>{escape(r['game_username'])}</code>")
+            lines.append(f"┗ {game_name} · đặt lúc {fmt_dt(created)} · còn {mins // 60}h{mins % 60:02d}p")
+        lines.append("")
+        lines.append(
+            f"{e('hourglass')} <i>Quá {ORDER_TIMEOUT_HOURS}h chưa nhập code thành công sẽ tự huỷ &amp; hoàn tiền.</i>"
+        )
+    return "\n".join(lines), page_kb("ord", page, pages)
+
+
+@dp.message(F.text == BTN_ORDERS)
+async def menu_orders(message: types.Message, state: FSMContext):
+    await state.clear()
+    text, kb = await build_orders(message.from_user.id, 0)
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("ord:"))
+async def cb_orders(call: types.CallbackQuery):
+    page = int(call.data.split(":")[1])
+    text, kb = await build_orders(call.from_user.id, page)
+    await edit_or_send(call, text, kb)
+    await call.answer()
+
+
+# ---- Nhóm Hỗ Trợ -----------------------------------------------------
+@dp.message(F.text == BTN_SUPPORT)
+async def menu_support(message: types.Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [url_btn("Nhóm Hỗ Trợ", "mega", f"https://t.me/{SUPPORT_GROUP}")],
+        [url_btn("Admin Hỗ Trợ", "shield", f"https://t.me/{SUPPORT_ADMIN}")],
+    ])
     await message.answer(
-        f"{e('money2')} <b>NẠP TIỀN</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{e('link')} ID của bạn: <code>{message.from_user.id}</code>\n"
-        f"{e('money')} Số dư hiện tại: <b>{bal:,}đ</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{e('plus')} Gửi ID trên cho Admin để được nạp tiền."
+        f"{e('shield')} <b>HỖ TRỢ KHÁCH HÀNG</b>\n"
+        f"{SEP}\n"
+        f"{e('mega')} Nhóm hỗ trợ: @{SUPPORT_GROUP}\n"
+        f"{e('user')} Admin hỗ trợ: @{SUPPORT_ADMIN}\n"
+        f"{SEP}\n"
+        f"{e('bulb')} Cần giúp đỡ về nạp tiền, đơn hàng hoặc nhập code, hãy liên hệ ngay!",
+        reply_markup=kb,
     )
 
 
 # ---- Nhập Code -------------------------------------------------------
+def game_list_content(bal: int):
+    text = (
+        f"{e('fire')} <b>NHẬP CODE</b>\n"
+        f"{SEP}\n"
+        f"{e('wallet')} Số dư: <b>{bal:,}đ</b>\n"
+        f"{e('down')} Chọn game cần mua slot nhập code:"
+    )
+    rows = [
+        [inline_btn(f"{g['name']}  •  {g['price']:,}đ", "game", f"game:{key}")]
+        for key, g in GAMES.items()
+    ]
+    rows.append([inline_btn("Đóng", "no", "game:cancel")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(F.text == BTN_CODE)
 async def menu_code(message: types.Message, state: FSMContext):
     await state.clear()
     bal = await get_user_balance(message.from_user.id)
-    await message.answer(
-        f"{e('fire')} <b>NHẬP CODE</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{e('money')} Số dư: <b>{bal:,}đ</b>\n"
-        f"{e('down')} Chọn game cần mua slot nhập code:",
-        reply_markup=game_select_kb(),
-    )
+    text, kb = game_list_content(bal)
+    await message.answer(text, reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("game:"))
@@ -360,7 +778,14 @@ async def choose_game(call: types.CallbackQuery, state: FSMContext):
     key = call.data.split(":", 1)[1]
     if key == "cancel":
         await state.clear()
-        await call.message.edit_text(f"{e('no')} Đã hủy thao tác.")
+        await edit_or_send(call, f"{e('no')} Đã đóng.")
+        await call.answer()
+        return
+    if key == "back":
+        await state.clear()
+        bal = await get_user_balance(call.from_user.id)
+        text, kb = game_list_content(bal)
+        await edit_or_send(call, text, kb)
         await call.answer()
         return
 
@@ -369,26 +794,59 @@ async def choose_game(call: types.CallbackQuery, state: FSMContext):
         await call.answer("Game không tồn tại!", show_alert=True)
         return
 
+    text = (
+        f"{e('gem')} <b>Mệnh giá code: Random</b>\n"
+        f"{e('game')} Game: <b>{game['name']}</b>\n"
+        f"{e('money')} Giá bán: <b>{game['price']:,}đ</b> / tài khoản\n"
+        f"{SEP}\n"
+        f"{e('receipt')} <b>HƯỚNG DẪN MUA HÀNG:</b>\n"
+        f"• Mua được nhiều nick cùng lúc.\n"
+        f"• Mỗi nick nhập 1 dòng, gửi cho bot chỉ gửi tên nick.\n"
+        f"{SEP}\n"
+        f"{e('hourglass')} Đơn hàng sẽ được nhập code từ <b>1–{ORDER_TIMEOUT_HOURS}h</b>. "
+        f"Quá <b>{ORDER_TIMEOUT_HOURS}h</b> nếu đơn hàng chưa được nhập code thành công sẽ "
+        f"<b>tự động huỷ đơn và hoàn tiền</b>."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [inline_btn("Mua Ngay", "fire", f"buy:{key}")],
+        [inline_btn("Quay lại", "reload", "game:back")],
+    ])
+    await edit_or_send(call, text, kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("buy:"))
+async def buy_start(call: types.CallbackQuery, state: FSMContext):
+    key = call.data.split(":", 1)[1]
+    game = GAMES.get(key)
+    if not game:
+        await call.answer("Game không tồn tại!", show_alert=True)
+        return
+
     bal = await get_user_balance(call.from_user.id)
     if bal < game["price"]:
-        await call.message.edit_text(
+        kb = InlineKeyboardMarkup(inline_keyboard=[[inline_btn("Nạp Tiền", "money", "dep:menu")]])
+        await edit_or_send(
+            call,
             f"{e('no')} <b>Số dư không đủ!</b>\n"
             f"{e('money')} Cần tối thiểu: <b>{game['price']:,}đ</b>\n"
-            f"{e('money2')} Số dư hiện tại: <b>{bal:,}đ</b>\n"
-            f"{e('plus')} Bấm <b>{BTN_DEPOSIT}</b> để nạp thêm."
+            f"{e('wallet')} Số dư hiện tại: <b>{bal:,}đ</b>\n"
+            f"{e('plus')} Bấm <b>Nạp Tiền</b> để nạp thêm.",
+            kb,
         )
         await call.answer()
         return
 
+    await state.clear()
     await state.update_data(game=key)
     await state.set_state(BotStates.waiting_for_username)
-    await call.message.edit_text(
-        f"{e('top')} Game: <b>{game['name']}</b>\n"
-        f"{e('money')} Giá: <b>{game['price']:,}đ / tài khoản</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{e('mail')} Nhập <b>tên tài khoản</b> cần nhập code.\n"
-        f"{e('plus')} Muốn đăng ký nhiều tài khoản, mỗi tài khoản <b>một dòng</b>, ví dụ:\n"
-        f"<code>bolatienphong\nnoapq1983</code>"
+    await edit_or_send(
+        call,
+        f"{e('game')} Game: <b>{game['name']}</b>  •  {e('money')} <b>{game['price']:,}đ / tài khoản</b>\n"
+        f"{SEP}\n"
+        f"{e('mail')} Gửi <b>tên tài khoản</b> cần nhập code.\n"
+        f"{e('plus')} Muốn mua nhiều nick, mỗi nick <b>một dòng</b> (tối đa {MAX_BATCH}), ví dụ:\n"
+        f"<code>bolatienphong\nnoapq1983</code>",
     )
     await call.answer()
 
@@ -408,7 +866,7 @@ def parse_usernames(raw: str) -> list[str]:
 
 
 @dp.message(BotStates.waiting_for_username)
-async def buy_code_finish(message: types.Message, state: FSMContext):
+async def buy_code_preview(message: types.Message, state: FSMContext):
     raw = message.text or ""
     if raw.strip() in MENU_TEXTS or raw.strip().startswith("/"):
         await message.answer(f"{e('no')} Tên tài khoản không hợp lệ, nhập lại:")
@@ -419,7 +877,7 @@ async def buy_code_finish(message: types.Message, state: FSMContext):
         await message.answer(f"{e('no')} Tên tài khoản không được để trống, nhập lại:")
         return
     if len(names) > MAX_BATCH:
-        await message.answer(f"{e('no')} Mỗi lần chỉ đăng ký tối đa <b>{MAX_BATCH}</b> tài khoản, nhập lại:")
+        await message.answer(f"{e('no')} Mỗi lần chỉ mua tối đa <b>{MAX_BATCH}</b> tài khoản, nhập lại:")
         return
     if any(len(n) > 50 for n in names):
         await message.answer(f"{e('no')} Có tên tài khoản quá dài (tối đa 50 ký tự), nhập lại:")
@@ -429,14 +887,78 @@ async def buy_code_finish(message: types.Message, state: FSMContext):
     game_key = data.get("game", "78win")
     game = GAMES.get(game_key, GAMES["78win"])
     price = game["price"]
-    user_id = message.from_user.id
+    uid = message.from_user.id
 
+    # Xem trước: loại các nick đang có đơn chờ
+    async with db_pool.acquire() as conn:
+        busy_rows = await conn.fetch(
+            "SELECT lower(game_username) AS u FROM hunt_accounts "
+            "WHERE game = $1 AND status = 'active' AND lower(game_username) = ANY($2::text[])",
+            game_key, [n.lower() for n in names],
+        )
+    busy = {r["u"] for r in busy_rows}
+    rejected = [n for n in names if n.lower() in busy]
+    valid = [n for n in names if n.lower() not in busy]
+    bal = await get_user_balance(uid)
+
+    rejected_text = ""
+    if rejected:
+        rejected_list = "\n".join(f"• <code>{escape(n)}</code>" for n in rejected)
+        rejected_text = (
+            f"\n{SEP}\n"
+            f"{e('no')} <b>Bỏ qua ({len(rejected)})</b> - đang chờ nhập code:\n{rejected_list}"
+        )
+
+    if not valid:
+        await state.clear()
+        await message.answer(f"{e('no')} <b>Không thể đăng ký!</b>{rejected_text}")
+        return
+
+    total = price * len(valid)
+    if bal < total:
+        await state.clear()
+        kb = InlineKeyboardMarkup(inline_keyboard=[[inline_btn("Nạp Tiền", "money", "dep:menu")]])
+        await message.answer(
+            f"{e('no')} <b>Số dư không đủ!</b>\n"
+            f"{e('pc')} Số tài khoản hợp lệ: <b>{len(valid)}</b>\n"
+            f"{e('money')} Cần: <b>{total:,}đ</b>\n"
+            f"{e('wallet')} Số dư hiện tại: <b>{bal:,}đ</b>\n"
+            f"{e('plus')} Bấm <b>Nạp Tiền</b> để nạp thêm."
+            f"{rejected_text}",
+            reply_markup=kb,
+        )
+        return
+
+    await state.update_data(names=valid, game=game_key)
+    await state.set_state(BotStates.confirm_order)
+    valid_list = "\n".join(f"• <code>{escape(n)}</code>" for n in valid)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [inline_btn("Xác Nhận Mua", "ok", "order:confirm"), inline_btn("Hủy", "no", "order:cancel")],
+    ])
+    await message.answer(
+        f"{e('receipt')} <b>THÔNG TIN ĐƠN HÀNG</b>\n"
+        f"{SEP}\n"
+        f"{e('game')} Game: <b>{game['name']}</b>\n"
+        f"{e('gem')} Mệnh giá code: <b>Random</b>\n"
+        f"{e('pc')} <b>Tài khoản ({len(valid)}):</b>\n{valid_list}\n"
+        f"{SEP}\n"
+        f"{e('money')} Đơn giá: <b>{price:,}đ</b> × {len(valid)}\n"
+        f"{e('cash')} Tổng thanh toán: <b>{total:,}đ</b>\n"
+        f"{e('wallet')} Số dư hiện tại: <b>{bal:,}đ</b>\n"
+        f"{e('bag')} Số dư sau khi mua: <b>{bal - total:,}đ</b>\n"
+        f"{SEP}\n"
+        f"{e('hourglass')} Nhập code trong <b>1–{ORDER_TIMEOUT_HOURS}h</b>, quá hạn tự huỷ &amp; hoàn tiền."
+        f"{rejected_text}\n\n"
+        f"{e('down')} Bấm <b>Xác Nhận Mua</b> để thanh toán.",
+        reply_markup=kb,
+    )
+
+
+async def process_purchase(user_id: int, game_key: str, names: list[str]) -> dict:
+    """Trừ tiền + tạo đơn trong 1 transaction (kiểm tra lại trùng & số dư)."""
+    game = GAMES.get(game_key, GAMES["78win"])
+    price = game["price"]
     result = "ok"
-    valid: list[str] = []
-    rejected: list[str] = []
-    bal = 0
-    total = 0
-
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             # Khóa toàn cục ngắn để tránh 2 người đăng ký trùng 1 tài khoản cùng lúc
@@ -447,8 +969,7 @@ async def buy_code_finish(message: types.Message, state: FSMContext):
             busy_rows = await conn.fetch(
                 "SELECT lower(game_username) AS u FROM hunt_accounts "
                 "WHERE game = $1 AND status = 'active' AND lower(game_username) = ANY($2::text[])",
-                game_key,
-                [n.lower() for n in names],
+                game_key, [n.lower() for n in names],
             )
             busy = {r["u"] for r in busy_rows}
             rejected = [n for n in names if n.lower() in busy]
@@ -465,51 +986,117 @@ async def buy_code_finish(message: types.Message, state: FSMContext):
                     "INSERT INTO hunt_accounts (user_id, game_username, status, game) VALUES ($1, $2, 'active', $3)",
                     [(user_id, n, game_key) for n in valid],
                 )
+                note = f"{game['name']} x{len(valid)}: " + ", ".join(valid)
+                await add_tx(conn, user_id, -total, "purchase", note[:200])
+    return {"result": result, "valid": valid, "rejected": rejected, "bal": bal, "total": total, "game": game}
 
-    rejected_text = ""
-    if rejected:
-        rejected_text = (
-            f"\n━━━━━━━━━━━━━━━━━━\n"
-            f"{e('no')} <b>Không đăng ký được ({len(rejected)})</b> - đang chờ nhập code, "
-            f"chỉ đăng ký lại được khi đơn thành công hoặc bị Admin hủy:\n"
-            + "\n".join(f"• <code>{escape(n)}</code>" for n in rejected)
-        )
 
-    if result == "all_busy":
-        await state.clear()
-        await message.answer(
-            f"{e('no')} <b>Không thể đăng ký!</b>{rejected_text}",
-            reply_markup=main_kb,
-        )
-        return
-
-    if result == "no_balance":
-        await state.clear()
-        await message.answer(
-            f"{e('no')} <b>Số dư không đủ!</b>\n"
-            f"{e('pc')} Số tài khoản hợp lệ: <b>{len(valid)}</b>\n"
-            f"{e('money')} Cần: <b>{total:,}đ</b>\n"
-            f"{e('money2')} Số dư hiện tại: <b>{bal:,}đ</b>\n"
-            f"{e('plus')} Bấm <b>{BTN_DEPOSIT}</b> để nạp thêm."
-            f"{rejected_text}",
-            reply_markup=main_kb,
-        )
-        return
-
-    await message.answer(
-        f"{e('ok')} <b>MUA SLOT THÀNH CÔNG!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{e('top')} Game: <b>{game['name']}</b>\n"
-        f"{e('reload')} Trạng thái: <b>Đang chờ nhập code</b>\n"
-        f"{e('pc')} <b>Tài khoản ({len(valid)}):</b>\n"
-        + "\n".join(f"• <code>{escape(n)}</code>" for n in valid)
-        + f"\n━━━━━━━━━━━━━━━━━━\n"
-        f"{e('money')} Đã trừ: <b>{total:,}đ</b>\n"
-        f"{e('money2')} Số dư còn lại: <b>{bal - total:,}đ</b>"
-        f"{rejected_text}",
-        reply_markup=main_kb,
-    )
+@dp.callback_query(F.data == "order:cancel")
+async def order_cancel(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    await edit_or_send(call, f"{e('no')} Đã hủy đơn hàng.")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "order:confirm")
+async def order_confirm(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    names = data.get("names")
+    game_key = data.get("game", "78win")
+    await state.clear()  # chống bấm xác nhận 2 lần
+    if not names:
+        await edit_or_send(call, f"{e('no')} Phiên mua hàng đã hết hạn, vui lòng bấm <b>{BTN_CODE}</b> để mua lại.")
+        await call.answer()
+        return
+
+    r = await process_purchase(call.from_user.id, game_key, names)
+    rejected_text = ""
+    if r["rejected"]:
+        rejected_list = "\n".join(f"• <code>{escape(n)}</code>" for n in r["rejected"])
+        rejected_text = f"\n{SEP}\n{e('no')} <b>Không đăng ký được ({len(r['rejected'])})</b> - đang chờ nhập code:\n{rejected_list}"
+
+    if r["result"] == "all_busy":
+        await edit_or_send(call, f"{e('no')} <b>Không thể đăng ký!</b>{rejected_text}")
+    elif r["result"] == "no_balance":
+        kb = InlineKeyboardMarkup(inline_keyboard=[[inline_btn("Nạp Tiền", "money", "dep:menu")]])
+        await edit_or_send(
+            call,
+            f"{e('no')} <b>Số dư không đủ!</b>\n"
+            f"{e('money')} Cần: <b>{r['total']:,}đ</b>\n"
+            f"{e('wallet')} Số dư hiện tại: <b>{r['bal']:,}đ</b>"
+            f"{rejected_text}",
+            kb,
+        )
+    else:
+        valid_list = "\n".join(f"• <code>{escape(n)}</code>" for n in r["valid"])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [inline_btn("Xem Đơn Hàng", "gift", "ord:0"), inline_btn("Menu Chính", "up", "home")],
+        ])
+        await edit_or_send(
+            call,
+            f"{e('ok')} <b>MUA SLOT THÀNH CÔNG!</b>\n"
+            f"{SEP}\n"
+            f"{e('game')} Game: <b>{r['game']['name']}</b>\n"
+            f"{e('reload')} Trạng thái: <b>Đang chờ nhập code</b>\n"
+            f"{e('pc')} <b>Tài khoản ({len(r['valid'])}):</b>\n{valid_list}\n"
+            f"{SEP}\n"
+            f"{e('money')} Đã trừ: <b>{r['total']:,}đ</b>\n"
+            f"{e('wallet')} Số dư còn lại: <b>{r['bal'] - r['total']:,}đ</b>"
+            f"{rejected_text}",
+            kb,
+        )
+    await call.answer()
+
+
+# =====================================================================
+# TỰ ĐỘNG HUỶ ĐƠN QUÁ HẠN + HOÀN TIỀN
+# =====================================================================
+async def expire_old_orders():
+    refunds: dict[int, list[tuple[str, int]]] = {}
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                "UPDATE hunt_accounts SET status = 'expired' "
+                "WHERE status = 'active' AND created_at < now() - ($1 * interval '1 hour') "
+                "RETURNING user_id, game_username, game",
+                ORDER_TIMEOUT_HOURS,
+            )
+            for r in rows:
+                price = GAMES.get(r["game"] or "78win", GAMES["78win"])["price"]
+                await get_user_balance_tx(conn, r["user_id"])
+                await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", price, r["user_id"])
+                await add_tx(conn, r["user_id"], price, "refund", f"Quá {ORDER_TIMEOUT_HOURS}h: {r['game_username']}"[:200])
+                refunds.setdefault(r["user_id"], []).append((r["game_username"], price))
+
+    for uid, items in refunds.items():
+        total = sum(p for _, p in items)
+        names = "\n".join(f"• <code>{escape(n)}</code>" for n, _ in items)
+        try:
+            await bot.send_message(
+                uid,
+                f"{e('hourglass')} <b>ĐƠN HÀNG QUÁ {ORDER_TIMEOUT_HOURS}H - TỰ ĐỘNG HUỶ</b>\n"
+                f"{SEP}\n"
+                f"{e('pc')} Tài khoản chưa nhập code thành công:\n{names}\n"
+                f"{SEP}\n"
+                f"{e('money')} Đã hoàn: <b>{total:,}đ</b> vào ví của bạn.",
+            )
+        except Exception:
+            pass
+
+
+async def get_user_balance_tx(conn, user_id: int):
+    await conn.execute(
+        "INSERT INTO users (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING", user_id
+    )
+
+
+async def expire_orders_loop():
+    while True:
+        try:
+            await expire_old_orders()
+        except Exception as ex:
+            print(f"Lỗi quét đơn quá hạn: {ex}")
+        await asyncio.sleep(600)
 
 
 # =====================================================================
@@ -524,11 +1111,41 @@ async def admin_add_money(message: types.Message):
         target_id, amount = int(target_id), int(amount)
         await get_user_balance(target_id)
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount, target_id)
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE users SET balance = balance + $1, total_deposit = COALESCE(total_deposit, 0) + $1 "
+                    "WHERE user_id = $2",
+                    amount, target_id,
+                )
+                await add_tx(conn, target_id, amount, "deposit", "Nạp tiền vào ví")
         await message.answer(f"{e('ok')} Đã nạp <b>{amount:,}đ</b> cho <code>{target_id}</code>.")
-        await bot.send_message(target_id, f"{e('money')} Bạn được cộng <b>{amount:,}đ</b> vào tài khoản!")
+        await bot.send_message(
+            target_id,
+            f"{e('money')} <b>NẠP TIỀN THÀNH CÔNG</b>\n"
+            f"{SEP}\n"
+            f"{e('cash')} Bạn được cộng <b>{amount:,}đ</b> vào ví!",
+        )
     except Exception:
         await message.answer(f"{e('no')} Cú pháp: <code>/nap &lt;user_id&gt; &lt;so_tien&gt;</code>")
+
+
+@dp.message(Command("hoan"))
+async def admin_refund_money(message: types.Message):
+    """Hoàn tiền (không tính vào tổng tiền đã nạp): /hoan <user_id> <so_tien>"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        _, target_id, amount = message.text.split()
+        target_id, amount = int(target_id), int(amount)
+        await get_user_balance(target_id)
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount, target_id)
+                await add_tx(conn, target_id, amount, "refund", "Admin hoàn tiền")
+        await message.answer(f"{e('ok')} Đã hoàn <b>{amount:,}đ</b> cho <code>{target_id}</code>.")
+        await bot.send_message(target_id, f"{e('money')} Bạn được hoàn <b>{amount:,}đ</b> vào ví!")
+    except Exception:
+        await message.answer(f"{e('no')} Cú pháp: <code>/hoan &lt;user_id&gt; &lt;so_tien&gt;</code>")
 
 
 @dp.message(Command("tru"))
@@ -540,12 +1157,13 @@ async def admin_sub_money(message: types.Message):
         target_id, amount = int(target_id), int(amount)
         await get_user_balance(target_id)
         async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET balance = GREATEST(0, balance - $1) WHERE user_id = $2",
-                amount,
-                target_id,
-            )
-        await message.answer(f"{e('ok')} Đã trừ <b>{amount:,}đ</b> của <code>{target_id}</code>.")
+            async with conn.transaction():
+                old = await conn.fetchval("SELECT balance FROM users WHERE user_id = $1 FOR UPDATE", target_id)
+                taken = min(int(old or 0), amount)
+                await conn.execute("UPDATE users SET balance = balance - $1 WHERE user_id = $2", taken, target_id)
+                if taken:
+                    await add_tx(conn, target_id, -taken, "admin_sub", "Admin trừ tiền")
+        await message.answer(f"{e('ok')} Đã trừ <b>{taken:,}đ</b> của <code>{target_id}</code>.")
     except Exception:
         await message.answer(f"{e('no')} Cú pháp: <code>/tru &lt;user_id&gt; &lt;so_tien&gt;</code>")
 
@@ -572,7 +1190,7 @@ async def admin_cancel_order(message: types.Message):
         return
     await message.answer(
         f"{e('ok')} Đã hủy đơn <code>{escape(name)}</code>. "
-        f"Cần hoàn tiền thì dùng <code>/nap &lt;user_id&gt; &lt;so_tien&gt;</code>."
+        f"Cần hoàn tiền thì dùng <code>/hoan &lt;user_id&gt; &lt;so_tien&gt;</code>."
     )
     for r in rows:
         try:
@@ -597,7 +1215,7 @@ async def admin_stats(message: types.Message):
     )
     await message.answer(
         f"{e('top')} <b>THỐNG KÊ</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{SEP}\n"
         f"{e('pc')} Bộ quét nhóm: {scanner_status}\n"
         f"{e('shield')} Người dùng: <b>{total_users}</b>\n"
         f"{e('reload')} Tài khoản chờ nhập code: <b>{active_accs}</b>"
@@ -815,9 +1433,10 @@ async def start_scanner(session_str: str):
 
 async def main():
     await init_db()
+    background_tasks.append(asyncio.create_task(expire_orders_loop()))
     saved_session = await get_saved_session()
     if saved_session:
-        asyncio.create_task(start_scanner(saved_session))
+        background_tasks.append(asyncio.create_task(start_scanner(saved_session)))
     else:
         try:
             await bot.send_message(
