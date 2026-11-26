@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from io import BytesIO
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import asyncpg
 import ddddocr
@@ -502,6 +503,29 @@ def vietqr_url(amount: int, content: str) -> str:
     )
 
 
+def _download_vietqr_image(url: str) -> bytes:
+    """Tải ảnh QR từ VietQR về Railway; tránh để Telegram tự truy cập URL."""
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; DepositQRBot/1.0)",
+            "Accept": "image/png,image/*,*/*;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=25) as response:
+        image_data = response.read(5 * 1024 * 1024 + 1)
+        content_type = response.headers.get("Content-Type", "").lower()
+
+    if len(image_data) > 5 * 1024 * 1024:
+        raise ValueError("Ảnh QR vượt quá giới hạn 5 MB")
+    if not image_data.startswith(b"\x89PNG\r\n\x1a\n") and not content_type.startswith("image/"):
+        preview = image_data[:160].decode("utf-8", errors="replace")
+        raise ValueError(f"VietQR không trả về ảnh (Content-Type: {content_type}; nội dung: {preview})")
+    if not image_data:
+        raise ValueError("VietQR trả về dữ liệu ảnh rỗng")
+    return image_data
+
+
 async def send_deposit_qr(target: types.Message, uid: int, amount: int):
     content = f"{DEPOSIT_PREFIX} {uid}"
     caption = (
@@ -522,9 +546,14 @@ async def send_deposit_qr(target: types.Message, uid: int, amount: int):
         [inline_btn("Đổi số tiền", "reload", "dep:menu"), inline_btn("Menu Chính", "up", "home")],
     ])
     try:
-        await target.answer_photo(photo=vietqr_url(amount, content), caption=caption, reply_markup=kb)
+        # Tải ảnh về máy bot trước, sau đó upload bytes lên Telegram.
+        # Telegram không còn phải tự tải URL img.vietqr.io nên tránh lỗi
+        # "failed to get HTTP URL content".
+        qr_data = await asyncio.to_thread(_download_vietqr_image, vietqr_url(amount, content))
+        qr_file = types.BufferedInputFile(qr_data, filename=f"vietqr_{uid}_{amount}.png")
+        await target.answer_photo(photo=qr_file, caption=caption, reply_markup=kb)
     except Exception as ex:
-        print(f"Không gửi được ảnh QR: {ex}")
+        print(f"Không tải/gửi được ảnh QR: {type(ex).__name__}: {ex}")
         await target.answer(
             caption + f"\n{e('no')} <i>Không tải được ảnh QR, vui lòng chuyển khoản thủ công theo thông tin trên.</i>",
             reply_markup=kb,
