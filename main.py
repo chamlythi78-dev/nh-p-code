@@ -6,7 +6,7 @@ import re
 import subprocess
 import tempfile
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -61,7 +61,7 @@ MAX_BATCH = 30
 ORDER_TIMEOUT_HOURS = 72
 PAGE_SIZE = 8
 WARM_TAB_COUNT = int(os.getenv("WARM_TAB_COUNT", "6"))  # 6 tab mở sẵn, nhẹ server và vào cực nhanh
-REPLICAS_PER_CODE = int(os.getenv("REPLICAS_PER_CODE", "1"))  # mỗi code chạy 1 tab để không bị web chặn captcha
+REPLICAS_PER_CODE = int(os.getenv("REPLICAS_PER_CODE", "1"))  # (không còn dùng, giữ để tương thích)
 SPARE_TAB_COUNT = int(os.getenv("SPARE_TAB_COUNT", "0"))
 
 # Hỗ trợ
@@ -171,13 +171,17 @@ _tab_queue: asyncio.Queue | None = None
 _pool_lock = asyncio.Lock()
 _in_use = 0
 _tab_refreshed: dict = {}
+_tab_force_reload: set = set()  # tab bị lỗi captcha -> reload sạch khi trả về pool
 _tab_sem: asyncio.Semaphore | None = None
 _inflight_codes: set[str] = set()
 _dead_codes: dict[str, float] = {}
 _fire_tasks: set = set()
 TAB_MAX_AGE = 240
 DEAD_CODE_TTL = 120
-DEAD_CODE_RX = re.compile(r"mã code không đúng|code .*hết (lượt|hạn)|code .*đã (được )?sử dụng", re.I)
+DEAD_CODE_RX = re.compile(
+    r"mã code không đúng|không còn hợp lệ|đã được sử dụng|đã sử dụng|hết lượt|hết hạn|không tồn tại",
+    re.I,
+)
 
 
 def _get_tab_sem() -> asyncio.Semaphore:
@@ -379,25 +383,46 @@ async def init_browser_pool(tab_count: int = WARM_TAB_COUNT):
             await asyncio.gather(*(_make_tab() for _ in range(need)))
 
 
-async def borrow_warm_page():
-    """Lấy một tab đã mở sẵn trang nhập code từ pool; nếu đang bận hết thì chờ tab rảnh (tối đa 6s)."""
+async def borrow_warm_page(avoid=None):
+    """Lấy tab rảnh; ưu tiên tab KHÔNG nằm trong `avoid` (các tab đã thử lỗi)."""
     global _in_use
+    skipped = []
+    chosen = None
+    t_skip = 0.0
     try:
         if _tab_queue is None or _shared_browser is None or not _shared_browser.is_connected():
             await init_browser_pool(WARM_TAB_COUNT)
-        while True:
+        deadline = time.monotonic() + 6
+        while chosen is None:
             try:
                 page = _tab_queue.get_nowait()
             except asyncio.QueueEmpty:
-                try:
-                    page = await asyncio.wait_for(_tab_queue.get(), timeout=6)
-                except asyncio.TimeoutError:
+                remaining = deadline - time.monotonic()
+                if skipped and (time.monotonic() - t_skip > 1.0 or remaining <= 0):
+                    chosen = skipped.pop(0)  # chờ lâu quá thì đành dùng lại tab cũ
                     break
-            if page and not page.is_closed():
-                _in_use += 1
-                return page, True
+                if remaining <= 0:
+                    break
+                try:
+                    page = await asyncio.wait_for(_tab_queue.get(), timeout=min(0.3, remaining))
+                except asyncio.TimeoutError:
+                    continue
+            if page.is_closed():
+                continue
+            if avoid and page in avoid:
+                if not skipped:
+                    t_skip = time.monotonic()
+                skipped.append(page)
+                continue
+            chosen = page
     except Exception:
         pass
+    finally:
+        for p in skipped:
+            _tab_queue.put_nowait(p)
+    if chosen is not None:
+        _in_use += 1
+        return chosen, True
     if _shared_browser and _shared_browser.is_connected():
         page = await _create_warm_page(_shared_browser, timeout=15000)
         return page, False
@@ -405,10 +430,12 @@ async def borrow_warm_page():
 
 
 async def return_warm_page(page, from_pool: bool):
-    """Đưa tab về trạng thái sạch ngay lập tức (không reload chậm) và trả lại pool."""
+    """Đưa tab về trạng thái sạch và trả lại pool (tab lỗi captcha thì reload hẳn)."""
     global _in_use
     if from_pool:
         _in_use = max(0, _in_use - 1)
+    force = page in _tab_force_reload
+    _tab_force_reload.discard(page)
     if not page or page.is_closed():
         return
     if not from_pool or _tab_queue is None:
@@ -418,7 +445,7 @@ async def return_warm_page(page, from_pool: bool):
             pass
         return
     try:
-        await _prepare_page_on_target(page, timeout=10000, force_reload=False)
+        await _prepare_page_on_target(page, timeout=12000 if force else 10000, force_reload=force)
         await _tab_queue.put(page)
     except Exception:
         try:
@@ -1870,6 +1897,8 @@ def _ocr_sync(img_bytes: bytes) -> str:
             if idx in (2, 3):
                 weight += 1
             votes[text] += weight
+            if votes.most_common(1)[0][1] >= 4:  # thoát sớm: đã đủ chắc chắn
+                break
     if not votes:
         return ""
     return votes.most_common(1)[0][0]
@@ -2116,7 +2145,8 @@ async def _wait_after_verify(page, captcha_input, timeout_ms: int = 3200) -> tup
 
 
 CAPTCHA_ERR_RX = re.compile(r"không tải được captcha|tải captcha|làm mới hoặc thử lại", re.I)
-MAX_ATTEMPTS_PER_CODE = 3
+MAX_ATTEMPTS_PER_CODE = 4   # tối đa 4 lần, MỖI LẦN MỘT TAB KHÁC NHAU
+CAPTCHA_LOAD_FAIL = "Không tải được captcha"
 
 
 def _is_captcha_notice(low: str) -> bool:
@@ -2153,7 +2183,7 @@ async def _refresh_until_loaded(page, captcha_input):
     await _wait_captcha_ready(page, captcha_input, max_wait_ms=1200)
 
 
-async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 5, stop_check=None) -> tuple[str, str]:
+async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 2, stop_check=None) -> tuple[str, str]:
     clean_code = clean_text(code)
     clean_user = clean_text(game_username)
 
@@ -2163,7 +2193,7 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
 
     if page.url.rstrip("/") != TARGET_URL.rstrip("/") or await code_input.count() == 0:
         await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=15000)
-    await code_input.first.wait_for(state="visible", timeout=6000)
+    await code_input.first.wait_for(state="visible", timeout=5000)
 
     await _reset_page_state_fast(page)
 
@@ -2177,16 +2207,21 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
 
     # BƯỚC 3: chờ khung "Mã xác thực" hiện ra
     try:
-        await captcha_input.first.wait_for(state="visible", timeout=6000)
+        await captcha_input.first.wait_for(state="visible", timeout=4000)
     except Exception:
         popup = await _popup_text(page)
         if _is_code_verdict(popup):
             return "FAIL", popup
         return "RETRY", popup or "Web không hiện khung mã xác thực"
 
-    await _wait_captcha_ready(page, captcha_input, max_wait_ms=1200)
+    await _wait_captcha_ready(page, captcha_input, max_wait_ms=700)
 
-    # BƯỚC 4: luôn đọc mã trong ảnh -> nhập vào ô "Nhập mã captcha" -> bấm "Xác thực" để nhận phản hồi
+    # Captcha không tải được => bỏ tab này NGAY, vòng ngoài sẽ đổi sang tab khác
+    modal_txt = await _popup_text(page)
+    if CAPTCHA_ERR_RX.search(modal_txt or "") or not await _captcha_loaded(page, captcha_input):
+        return "RETRY", CAPTCHA_LOAD_FAIL
+
+    # BƯỚC 4: đọc mã trong ảnh -> nhập vào ô "Nhập mã captcha" -> bấm "Xác thực"
     last_notice = ""
     for _ in range(max_captcha_retry):
         if stop_check and stop_check():
@@ -2203,26 +2238,29 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
         except Exception:
             captcha_text = ""
 
-        # Nếu đọc được mã thì nhập thẳng vào ô captcha và bấm Xác thực để lấy phản hồi thật
         if captcha_text:
             await _fill_input_reliable(page, captcha_input.first, captcha_text.upper())
             if await click_text_button(page, r"xác thực", below=captcha_input.first):
-                outcome, notice = await _wait_after_verify(page, captcha_input)
+                outcome, notice = await _wait_after_verify(page, captcha_input, timeout_ms=2500)
                 low = notice.lower()
                 if outcome == "result":
                     if "thành công" in low and "thất bại" not in low and not _is_captcha_notice(low):
                         return "SUCCESS", notice
                     if _is_code_verdict(notice):
                         return "FAIL", notice
+                if CAPTCHA_ERR_RX.search(notice or ""):
+                    return "RETRY", CAPTCHA_LOAD_FAIL      # đổi tab ngay
                 last_notice = notice or last_notice
 
-        # Nếu chưa đọc được mã hoặc web vẫn báo lỗi captcha -> làm mới ảnh rồi thử lại
+        # Chưa đọc được mã / sai captcha -> làm mới ảnh rồi thử lại
         await _refresh_until_loaded(page, captcha_input)
         cur_popup = await _popup_text(page)
         if cur_popup and _is_code_verdict(cur_popup):
             return "FAIL", cur_popup
         if cur_popup:
             last_notice = cur_popup
+            if CAPTCHA_ERR_RX.search(cur_popup):
+                return "RETRY", CAPTCHA_LOAD_FAIL
 
     return "RETRY", f"Chưa vượt qua bước captcha ({last_notice or 'sai captcha'})"
 
@@ -2247,7 +2285,7 @@ async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, 
         print(f"Không gửi được báo cáo cho admin: {ex}")
 
 
-async def _attempt_code(code: str, game_username: str, owner_id: int, stop_check=None) -> tuple[str, str]:
+async def _attempt_code(code: str, game_username: str, owner_id: int, stop_check=None, avoid=None) -> tuple[str, str]:
     async def _run(page) -> tuple[str, str]:
         try:
             return await thu_mot_code(page, code, game_username, stop_check=stop_check)
@@ -2261,7 +2299,7 @@ async def _attempt_code(code: str, game_username: str, owner_id: int, stop_check
                 return "FAIL", notice
             return "ERROR", "Tab nhập code bị lỗi thao tác"
 
-    page, from_pool = await borrow_warm_page()
+    page, from_pool = await borrow_warm_page(avoid)
     if page is None:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -2269,8 +2307,13 @@ async def _attempt_code(code: str, game_username: str, owner_id: int, stop_check
                 return await _run(await browser.new_page())
             finally:
                 await browser.close()
+    if avoid is not None:
+        avoid.add(page)
     try:
-        return await _run(page)
+        status, note = await _run(page)
+        if status == "ERROR" or CAPTCHA_LOAD_FAIL in (note or ""):
+            _tab_force_reload.add(page)   # tab lỗi => reload sạch khi trả về pool
+        return status, note
     finally:
         fire(return_warm_page(page, from_pool))
 
@@ -2306,28 +2349,52 @@ async def _mark_account_done(acc, code: str):
 
 
 async def _run_accounts(accounts, codes: list[str]):
+    """
+    - Chia code vòng tròn cho tài khoản: 6 code/2 tài khoản = 3-3, 6 code/6 tài khoản = 1-1.
+    - Chạy song song tối đa WARM_TAB_COUNT tab.
+    - Tài khoản đã xong => code chưa dùng chuyển sang tài khoản chưa xong.
+    - Lỗi captcha => thử lại bằng TAB KHÁC (tối đa MAX_ATTEMPTS_PER_CODE lần).
+    - Code web báo "đã sử dụng/không còn hợp lệ" => bỏ hẳn, không thử lại.
+    """
     accs = {a["id"]: a for a in accounts}
+    acc_ids = list(accs)
+    n_acc = len(acc_ids)
     done: set[int] = set()
     dead: set[str] = set()
-    tried: set[tuple[int, str]] = set()
-    assigned: dict[int, int] = {aid: 0 for aid in accs}
-    active = [0]
+    verdict_tried: set[tuple[int, str]] = set()   # (tài khoản, code) web đã trả lời dứt khoát
     stats = {"SUCCESS": 0, "FAIL": 0, "RETRY": 0}
+    pending: deque[str] = deque(codes)
+    running = [0]
 
-    max_jobs = max(1, min(len(codes), WARM_TAB_COUNT))
-    replicas = max(1, min(REPLICAS_PER_CODE, WARM_TAB_COUNT // max_jobs))
+    # Chia vòng tròn: code thứ i -> tài khoản thứ i % n
+    plan: dict[str, int] = {c: acc_ids[i % n_acc] for i, c in enumerate(codes)}
 
-    def pick():
-        for code in codes:
-            if code in dead or code in _inflight_codes or is_dead(code):
+    def load_of(aid: int) -> int:
+        return sum(1 for c, a in plan.items() if a == aid and c not in dead)
+
+    def assign(code: str):
+        cur = plan.get(code)
+        if cur is not None and cur not in done and (cur, code) not in verdict_tried:
+            return cur
+        cands = [a for a in acc_ids if a not in done and (a, code) not in verdict_tried]
+        if not cands:
+            return None
+        aid = min(cands, key=lambda a: (load_of(a), a))   # chuyển cho tài khoản đang ít code nhất
+        plan[code] = aid
+        return aid
+
+    def take_job():
+        for _ in range(len(pending)):
+            code = pending.popleft()
+            if code in dead or is_dead(code):
                 continue
-            cands = [aid for aid in accs if aid not in done and (aid, code) not in tried]
-            if not cands:
+            if code in _inflight_codes:
+                pending.append(code)
                 continue
-            aid = min(cands, key=lambda a: (assigned[a], a))
+            aid = assign(code)
+            if aid is None:
+                continue
             _inflight_codes.add(code)
-            tried.add((aid, code))
-            assigned[aid] += 1
             return aid, code
         return None
 
@@ -2335,38 +2402,36 @@ async def _run_accounts(accounts, codes: list[str]):
         acc = accs[aid]
         game_user = clean_text(acc["game_username"])
         owner_id = acc["user_id"]
+
         if aid in done or not await _account_still_active(aid):
             done.add(aid)
+            pending.appendleft(code)       # code chưa dùng -> chuyển cho tài khoản khác
             return
 
         state = {"final": None, "last_note": ""}
+        used_tabs: set = set()
 
         def stop() -> bool:
             return aid in done or state["final"] is not None
 
-        async def replica():
-            for _ in range(MAX_ATTEMPTS_PER_CODE):
-                if stop():
-                    return
-                async with _get_tab_sem():
-                    status, note = await _attempt_code(code, game_user, owner_id, stop_check=stop)
-                if status == "SUCCESS":
-                    state["final"] = ("SUCCESS", note)
-                    return
-                if status == "FAIL":
-                    if state["final"] is None:
-                        state["final"] = ("FAIL", note)
-                    return
-                if status == "SKIP":
-                    return
-                state["last_note"] = note
-                await asyncio.sleep(0.1)
-
-        await asyncio.gather(*(replica() for _ in range(replicas)), return_exceptions=True)
+        for _ in range(MAX_ATTEMPTS_PER_CODE):
+            if stop():
+                break
+            async with _get_tab_sem():
+                status, note = await _attempt_code(
+                    code, game_user, owner_id, stop_check=stop, avoid=used_tabs
+                )
+            if status in ("SUCCESS", "FAIL"):
+                state["final"] = (status, note)
+                break
+            if status == "SKIP":
+                break
+            state["last_note"] = note        # RETRY/ERROR -> vòng sau lấy TAB KHÁC
 
         final = state["final"]
         if final is None:
             if aid in done:
+                pending.appendleft(code)     # tài khoản xong bằng code khác -> code này chuyển đi
                 return
             status = "RETRY"
             note = clean_text(state["last_note"]) or "Chưa vượt qua được bước captcha"
@@ -2376,24 +2441,31 @@ async def _run_accounts(accounts, codes: list[str]):
         ok = status == "SUCCESS"
         stats[status if status in ("SUCCESS", "FAIL") else "RETRY"] += 1
         if ok:
-            done.add(aid)
             dead.add(code)
-            await _mark_account_done(acc, code)
-        elif DEAD_CODE_RX.search(note or ""):
-            mark_dead(code)
-            dead.add(code)
+            if aid in done:
+                note = f"{note} (tài khoản đã xong trước đó, code dư)"
+            else:
+                done.add(aid)
+                await _mark_account_done(acc, code)
+        elif status == "FAIL":
+            verdict_tried.add((aid, code))
+            if DEAD_CODE_RX.search(note or ""):
+                mark_dead(code)
+                dead.add(code)
+            else:
+                pending.append(code)         # lỗi riêng tài khoản -> thử tài khoản khác
         fire(report_attempt_to_admin(code, game_user, owner_id, ok, note))
 
     async def job_worker():
         while True:
-            job = pick()
+            job = take_job()
             if job is None:
-                if active[0] == 0:
+                if running[0] == 0:
                     return
-                await asyncio.sleep(0.08)
+                await asyncio.sleep(0.05)
                 continue
             aid, code = job
-            active[0] += 1
+            running[0] += 1
             try:
                 await run_job(aid, code)
             except Exception as ex:
@@ -2406,8 +2478,9 @@ async def _run_accounts(accounts, codes: list[str]):
                 ))
             finally:
                 _inflight_codes.discard(code)
-                active[0] -= 1
+                running[0] -= 1
 
+    max_jobs = max(1, min(len(codes), WARM_TAB_COUNT))
     await asyncio.gather(*(job_worker() for _ in range(max_jobs)), return_exceptions=True)
 
     fire(bot.send_message(
