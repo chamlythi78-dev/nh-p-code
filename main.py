@@ -504,26 +504,47 @@ def vietqr_url(amount: int, content: str) -> str:
 
 
 def _download_vietqr_image(url: str) -> bytes:
-    """Tải ảnh QR từ VietQR về Railway; tránh để Telegram tự truy cập URL."""
+    """Tải và chuẩn hóa ảnh QR thành PNG RGB nhỏ, tương thích Telegram."""
     request = Request(
         url,
         headers={
             "User-Agent": "Mozilla/5.0 (compatible; DepositQRBot/1.0)",
-            "Accept": "image/png,image/*,*/*;q=0.8",
+            "Accept": "image/png,image/jpeg,image/*,*/*;q=0.8",
         },
     )
     with urlopen(request, timeout=25) as response:
-        image_data = response.read(5 * 1024 * 1024 + 1)
+        raw_data = response.read(5 * 1024 * 1024 + 1)
         content_type = response.headers.get("Content-Type", "").lower()
 
-    if len(image_data) > 5 * 1024 * 1024:
-        raise ValueError("Ảnh QR vượt quá giới hạn 5 MB")
-    if not image_data.startswith(b"\x89PNG\r\n\x1a\n") and not content_type.startswith("image/"):
-        preview = image_data[:160].decode("utf-8", errors="replace")
-        raise ValueError(f"VietQR không trả về ảnh (Content-Type: {content_type}; nội dung: {preview})")
-    if not image_data:
-        raise ValueError("VietQR trả về dữ liệu ảnh rỗng")
-    return image_data
+    if not raw_data:
+        raise ValueError("VietQR trả về dữ liệu rỗng")
+    if len(raw_data) > 5 * 1024 * 1024:
+        raise ValueError("Ảnh QR tải về vượt quá giới hạn 5 MB")
+
+    # Không tin phần mở rộng hoặc Content-Type từ máy chủ; giải mã thật
+    # bằng Pillow rồi mã hóa lại thành PNG RGB sạch để Telegram xử lý.
+    try:
+        with Image.open(BytesIO(raw_data)) as source:
+            source.load()
+            image = source.convert("RGB")
+    except Exception as exc:
+        preview = raw_data[:120].decode("utf-8", errors="replace")
+        raise ValueError(
+            f"VietQR không trả về ảnh hợp lệ "
+            f"(Content-Type: {content_type}; dữ liệu đầu: {preview})"
+        ) from exc
+
+    # Giữ ảnh QR trong kích thước an toàn, tránh ảnh quá lớn hoặc tỷ lệ lạ.
+    image.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    png_data = output.getvalue()
+
+    if not png_data.startswith(b"\\x89PNG\\r\\n\\x1a\\n"):
+        raise ValueError("Không thể chuẩn hóa ảnh QR thành PNG")
+    if len(png_data) > 10 * 1024 * 1024:
+        raise ValueError("Ảnh QR sau chuẩn hóa vượt quá giới hạn Telegram")
+    return png_data
 
 
 async def send_deposit_qr(target: types.Message, uid: int, amount: int):
