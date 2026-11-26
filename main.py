@@ -7,6 +7,7 @@ import asyncpg
 import ddddocr
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -14,32 +15,31 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from playwright.async_api import async_playwright
 
-# --- CẤU HÌNH TRỰC TIẾP (CHỈ CẦN ĐIỀN HOẶC ĐỂ TRONG ENV RAILWAY) ---
+# --- CẤU HÌNH ---
 API_ID = int(os.getenv("API_ID", "30309186"))
 API_HASH = os.getenv("API_HASH", "307273bc278e53017b5fdcd407c1d941")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "+84335442999")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9044293543:AAEFP_xv45GUuR76f382cekrDOaCjdE2zLw")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "9220244280"))
-
-# Railway tự cấp DATABASE_URL khi bạn thêm plugin PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 TARGET_GROUPS = ["official78wins", "FreeCode_78win"]
 TARGET_URL = "https://code78k.online/"
 CODE_PRICE = 10000
 
-# --- KHỞI TẠO BOT, USERBOT & OCR ---
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 ocr = ddddocr.DdddOcr(show_ad=False)
 db_pool: asyncpg.Pool | None = None
+userbot: TelegramClient | None = None
+temp_login_client: TelegramClient | None = None
 
 
-class BuyCodeState(StatesGroup):
+class BotStates(StatesGroup):
     waiting_for_username = State()
+    waiting_for_otp = State()
+    waiting_for_2fa = State()
 
 
 main_kb = ReplyKeyboardMarkup(
@@ -54,7 +54,7 @@ main_kb = ReplyKeyboardMarkup(
 async def init_db():
     global db_pool
     if not DATABASE_URL:
-        raise RuntimeError("Thiếu DATABASE_URL! Hãy thêm PostgreSQL vào project trên Railway.")
+        raise RuntimeError("Thiếu DATABASE_URL trên Railway!")
     db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -71,6 +71,26 @@ async def init_db():
                 status TEXT DEFAULT 'active'
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+
+async def get_saved_session() -> str:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'telethon_session'")
+        return row["value"].strip() if row else ""
+
+
+async def save_session(session_str: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('telethon_session', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, session_str)
 
 
 async def get_user_balance(user_id: int) -> int:
@@ -81,6 +101,69 @@ async def get_user_balance(user_id: int) -> int:
         )
         row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
         return int(row["balance"]) if row else 0
+
+
+# --- LỆNH ĐĂNG NHẬP USERBOT TRỰC TIẾP TRÊN BOT (CHỈ ADMIN) ---
+@dp.message(Command("login"))
+async def admin_login_start(message: types.Message, state: FSMContext):
+    global temp_login_client
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        if temp_login_client:
+            await temp_login_client.disconnect()
+        temp_login_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await temp_login_client.connect()
+        await temp_login_client.send_code_request(PHONE_NUMBER)
+        await message.answer(
+            f"📲 Đã gửi mã OTP về SĐT `{PHONE_NUMBER}`.\n"
+            f"✍️ Hãy nhập mã OTP vào đây (thêm chữ `a` phía trước nếu sợ Telegram chặn, ví dụ: `a12345`):",
+            parse_mode="Markdown",
+        )
+        await state.set_state(BotStates.waiting_for_otp)
+    except Exception as e:
+        await message.answer(f"❌ Lỗi gửi OTP: `{e}`", parse_mode="Markdown")
+
+
+@dp.message(BotStates.waiting_for_otp)
+async def admin_login_otp(message: types.Message, state: FSMContext):
+    global temp_login_client
+    if message.from_user.id != ADMIN_ID:
+        return
+    otp = re.sub(r"\D", "", message.text)
+    if not otp:
+        await message.answer("⚠️ Mã OTP không hợp lệ, nhập lại:")
+        return
+    try:
+        await temp_login_client.sign_in(PHONE_NUMBER, otp)
+        session_str = temp_login_client.session.save()
+        await save_session(session_str)
+        await state.clear()
+        await message.answer("✅ Đăng nhập nick quét thành công và đã lưu vào PostgreSQL! Đang khởi động bộ quét...")
+        asyncio.create_task(start_scanner(session_str))
+    except SessionPasswordNeededError:
+        await message.answer("🔐 Nick có bật mật khẩu 2 bước (2FA). Vui lòng nhập mật khẩu:")
+        await state.set_state(BotStates.waiting_for_2fa)
+    except Exception as e:
+        await message.answer(f"❌ Lỗi xác nhận OTP: `{e}`\nGõ `/login` để thử lại.", parse_mode="Markdown")
+        await state.clear()
+
+
+@dp.message(BotStates.waiting_for_2fa)
+async def admin_login_2fa(message: types.Message, state: FSMContext):
+    global temp_login_client
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        await temp_login_client.sign_in(password=message.text.strip())
+        session_str = temp_login_client.session.save()
+        await save_session(session_str)
+        await state.clear()
+        await message.answer("✅ Đăng nhập 2FA thành công! Đang khởi động bộ quét...")
+        asyncio.create_task(start_scanner(session_str))
+    except Exception as e:
+        await message.answer(f"❌ Sai mật khẩu 2FA: `{e}`\nGõ `/login` để thử lại.", parse_mode="Markdown")
+        await state.clear()
 
 
 # --- LỆNH NGƯỜI DÙNG ---
@@ -114,14 +197,14 @@ async def buy_code_start(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Số dư không đủ! Cần tối thiểu {CODE_PRICE:,}đ.")
         return
     await message.answer("✍️ Nhập **tên tài khoản đăng ký** cần săn code:")
-    await state.set_state(BuyCodeState.waiting_for_username)
+    await state.set_state(BotStates.waiting_for_username)
 
 
-@dp.message(BuyCodeState.waiting_for_username)
+@dp.message(BotStates.waiting_for_username)
 async def buy_code_finish(message: types.Message, state: FSMContext):
     game_user = message.text.strip()
     if not game_user:
-        await message.answer("⚠️ Tên tài khoản không được để trống, vui lòng nhập lại:")
+        await message.answer("⚠️ Tên tài khoản không được để trống, nhập lại:")
         return
 
     user_id = message.from_user.id
@@ -173,9 +256,6 @@ async def admin_add_money(message: types.Message):
     try:
         _, target_id, amount = message.text.split()
         target_id, amount = int(target_id), int(amount)
-        if amount <= 0:
-            await message.answer("⚠️ Số tiền nạp phải lớn hơn 0.")
-            return
         await get_user_balance(target_id)
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount, target_id)
@@ -192,9 +272,6 @@ async def admin_sub_money(message: types.Message):
     try:
         _, target_id, amount = message.text.split()
         target_id, amount = int(target_id), int(amount)
-        if amount <= 0:
-            await message.answer("⚠️ Số tiền trừ phải lớn hơn 0.")
-            return
         await get_user_balance(target_id)
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -214,12 +291,12 @@ async def admin_stats(message: types.Message):
     async with db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         active_accs = await conn.fetchval("SELECT COUNT(*) FROM hunt_accounts WHERE status = 'active'")
-        done_accs = await conn.fetchval("SELECT COUNT(*) FROM hunt_accounts WHERE status = 'done'")
+    scanner_status = "🟢 Đang chạy" if (userbot and userbot.is_connected()) else "🔴 Chưa đăng nhập (/login)"
     await message.answer(
         f"📊 **THỐNG KÊ**\n"
+        f"📡 Bộ quét nhóm: {scanner_status}\n"
         f"👥 Người dùng: {total_users}\n"
-        f"🎯 Tài khoản chờ săn: {active_accs}\n"
-        f"✅ Tài khoản đã trúng: {done_accs}",
+        f"🎯 Tài khoản chờ săn: {active_accs}",
         parse_mode="Markdown",
     )
 
@@ -303,12 +380,8 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
 
 
 async def chay_san_code_cho_tai_khoan(codes: list[str], game_username: str) -> str | None:
-    executable = "/run/current-system/sw/bin/chromium" if os.path.exists("/run/current-system/sw/bin/chromium") else None
     async with async_playwright() as p:
-        launch_args = {"headless": True}
-        if executable:
-            launch_args["executable_path"] = executable
-        browser = await p.chromium.launch(**launch_args)
+        browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
             for code in codes:
@@ -320,50 +393,63 @@ async def chay_san_code_cho_tai_khoan(codes: list[str], game_username: str) -> s
 
 
 # --- QUÉT NHÓM LIÊN TỤC ---
-@userbot.on(events.NewMessage(chats=TARGET_GROUPS))
-async def scanner_handler(event):
-    codes = extract_clean_codes(event.raw_text)
-    if not codes:
-        return
+async def start_scanner(session_str: str):
+    global userbot
+    if userbot and userbot.is_connected():
+        await userbot.disconnect()
 
-    async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT id, user_id, game_username FROM hunt_accounts WHERE status = 'active'")
+    userbot = TelegramClient(StringSession(session_str), API_ID, API_HASH)
 
-    for acc in accounts:
-        record_id = acc["id"]
-        owner_id = acc["user_id"]
-        game_user = acc["game_username"]
+    @userbot.on(events.NewMessage(chats=TARGET_GROUPS))
+    async def scanner_handler(event):
+        codes = extract_clean_codes(event.raw_text)
+        if not codes:
+            return
 
-        try:
-            won_code = await chay_san_code_cho_tai_khoan(codes, game_user)
-            if won_code:
-                async with db_pool.acquire() as conn:
-                    await conn.execute("UPDATE hunt_accounts SET status = 'done' WHERE id = $1", record_id)
-                msg = f"🎉 **TRÚNG CODE!**\n👤 Tài khoản: `{game_user}`\n🎫 Mã code: `{won_code}`"
-                await bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
-                await bot.send_message(owner_id, msg, parse_mode="Markdown")
-            else:
-                await bot.send_message(
-                    owner_id,
-                    f"⏳ Đợt code hiện tại chưa khớp cho `{game_user}`. Hệ thống giữ tài khoản để chờ đợt code tiếp theo.",
-                    parse_mode="Markdown",
-                )
-        except Exception as e:
-            print(f"Lỗi khi săn code cho {game_user}: {e}")
+        async with db_pool.acquire() as conn:
+            accounts = await conn.fetch("SELECT id, user_id, game_username FROM hunt_accounts WHERE status = 'active'")
+
+        for acc in accounts:
+            record_id = acc["id"]
+            owner_id = acc["user_id"]
+            game_user = acc["game_username"]
+
+            try:
+                won_code = await chay_san_code_cho_tai_khoan(codes, game_user)
+                if won_code:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute("UPDATE hunt_accounts SET status = 'done' WHERE id = $1", record_id)
+                    msg = f"🎉 **TRÚNG CODE!**\n👤 Tài khoản: `{game_user}`\n🎫 Mã code: `{won_code}`"
+                    await bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+                    await bot.send_message(owner_id, msg, parse_mode="Markdown")
+                else:
+                    await bot.send_message(
+                        owner_id,
+                        f"⏳ Đợt code hiện tại chưa khớp cho `{game_user}`. Hệ thống giữ tài khoản để chờ đợt code tiếp theo.",
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                print(f"Lỗi săn code cho {game_user}: {e}")
+
+    await userbot.connect()
+    if await userbot.is_user_authorized():
+        await bot.send_message(ADMIN_ID, "🟢 Bộ quét nhóm Telegram đã hoạt động!")
+        await userbot.run_until_disconnected()
+    else:
+        await bot.send_message(ADMIN_ID, "⚠️ Phiên đăng nhập hết hạn. Gõ `/login` để đăng nhập lại.", parse_mode="Markdown")
 
 
 async def main():
     await init_db()
-    await userbot.start(phone=PHONE_NUMBER)
-    if not SESSION_STRING:
-        saved_session = userbot.session.save()
-        print("=== LƯU SESSION_STRING NÀY NẾU CHẠY TRÊN RAILWAY ===")
-        print(saved_session)
-        print("==================================================")
-    await asyncio.gather(
-        userbot.run_until_disconnected(),
-        dp.start_polling(bot),
-    )
+    saved_session = await get_saved_session()
+    if saved_session:
+        asyncio.create_task(start_scanner(saved_session))
+    else:
+        try:
+            await bot.send_message(ADMIN_ID, "⚠️ Chưa đăng nhập nick quét nhóm. Gõ `/login` để lấy OTP đăng nhập.", parse_mode="Markdown")
+        except Exception:
+            pass
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
