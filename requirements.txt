@@ -4,3 +4,4 @@ asyncpg
 playwright
 ddddocr
 Pillow
+CairoSVG>=2.7.1
