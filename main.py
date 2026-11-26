@@ -53,6 +53,8 @@ main_kb = ReplyKeyboardMarkup(
 
 async def init_db():
     global db_pool
+    if not DATABASE_URL:
+        raise RuntimeError("Thiếu DATABASE_URL! Hãy thêm PostgreSQL vào project trên Railway.")
     db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -118,8 +120,11 @@ async def buy_code_start(message: types.Message, state: FSMContext):
 @dp.message(BuyCodeState.waiting_for_username)
 async def buy_code_finish(message: types.Message, state: FSMContext):
     game_user = message.text.strip()
-    user_id = message.from_user.id
+    if not game_user:
+        await message.answer("⚠️ Tên tài khoản không được để trống, vui lòng nhập lại:")
+        return
 
+    user_id = message.from_user.id
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1 FOR UPDATE", user_id)
@@ -168,6 +173,9 @@ async def admin_add_money(message: types.Message):
     try:
         _, target_id, amount = message.text.split()
         target_id, amount = int(target_id), int(amount)
+        if amount <= 0:
+            await message.answer("⚠️ Số tiền nạp phải lớn hơn 0.")
+            return
         await get_user_balance(target_id)
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount, target_id)
@@ -184,6 +192,9 @@ async def admin_sub_money(message: types.Message):
     try:
         _, target_id, amount = message.text.split()
         target_id, amount = int(target_id), int(amount)
+        if amount <= 0:
+            await message.answer("⚠️ Số tiền trừ phải lớn hơn 0.")
+            return
         await get_user_balance(target_id)
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -203,8 +214,12 @@ async def admin_stats(message: types.Message):
     async with db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         active_accs = await conn.fetchval("SELECT COUNT(*) FROM hunt_accounts WHERE status = 'active'")
+        done_accs = await conn.fetchval("SELECT COUNT(*) FROM hunt_accounts WHERE status = 'done'")
     await message.answer(
-        f"📊 **THỐNG KÊ**\n👥 Người dùng: {total_users}\n🎯 Tài khoản chờ săn: {active_accs}",
+        f"📊 **THỐNG KÊ**\n"
+        f"👥 Người dùng: {total_users}\n"
+        f"🎯 Tài khoản chờ săn: {active_accs}\n"
+        f"✅ Tài khoản đã trúng: {done_accs}",
         parse_mode="Markdown",
     )
 
@@ -222,7 +237,7 @@ def extract_clean_codes(raw_text: str) -> list[str]:
     return list(dict.fromkeys(clean_codes))
 
 
-def doc_captcha(img_bytes: bytes) -> str:
+def _ocr_sync(img_bytes: bytes) -> str:
     img = Image.open(BytesIO(img_bytes)).convert("L")
     w, h = img.size
     img = img.resize((w * 3, h * 3), Image.Resampling.LANCZOS)
@@ -231,6 +246,10 @@ def doc_captcha(img_bytes: bytes) -> str:
     img.save(buf, format="PNG")
     text = ocr.classification(buf.getvalue())
     return re.sub(r"[^a-zA-Z0-9]", "", text)
+
+
+async def doc_captcha(img_bytes: bytes) -> str:
+    return await asyncio.to_thread(_ocr_sync, img_bytes)
 
 
 async def refresh_captcha_image(page, captcha_img, captcha_input):
@@ -260,7 +279,7 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
 
     for _ in range(max_captcha_retry):
         img_bytes = await captcha_img.screenshot()
-        captcha_text = doc_captcha(img_bytes)
+        captcha_text = await doc_captcha(img_bytes)
 
         if not captcha_text:
             await refresh_captcha_image(page, captcha_img, captcha_input)
@@ -315,24 +334,32 @@ async def scanner_handler(event):
         owner_id = acc["user_id"]
         game_user = acc["game_username"]
 
-        won_code = await chay_san_code_cho_tai_khoan(codes, game_user)
-        if won_code:
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE hunt_accounts SET status = 'done' WHERE id = $1", record_id)
-            msg = f"🎉 **TRÚNG CODE!**\n👤 Tài khoản: `{game_user}`\n🎫 Mã code: `{won_code}`"
-            await bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
-            await bot.send_message(owner_id, msg, parse_mode="Markdown")
-        else:
-            await bot.send_message(
-                owner_id,
-                f"⏳ Đợt code hiện tại chưa khớp cho `{game_user}`. Hệ thống giữ tài khoản để chờ đợt code tiếp theo.",
-                parse_mode="Markdown",
-            )
+        try:
+            won_code = await chay_san_code_cho_tai_khoan(codes, game_user)
+            if won_code:
+                async with db_pool.acquire() as conn:
+                    await conn.execute("UPDATE hunt_accounts SET status = 'done' WHERE id = $1", record_id)
+                msg = f"🎉 **TRÚNG CODE!**\n👤 Tài khoản: `{game_user}`\n🎫 Mã code: `{won_code}`"
+                await bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+                await bot.send_message(owner_id, msg, parse_mode="Markdown")
+            else:
+                await bot.send_message(
+                    owner_id,
+                    f"⏳ Đợt code hiện tại chưa khớp cho `{game_user}`. Hệ thống giữ tài khoản để chờ đợt code tiếp theo.",
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            print(f"Lỗi khi săn code cho {game_user}: {e}")
 
 
 async def main():
     await init_db()
     await userbot.start(phone=PHONE_NUMBER)
+    if not SESSION_STRING:
+        saved_session = userbot.session.save()
+        print("=== LƯU SESSION_STRING NÀY NẾU CHẠY TRÊN RAILWAY ===")
+        print(saved_session)
+        print("==================================================")
     await asyncio.gather(
         userbot.run_until_disconnected(),
         dp.start_polling(bot),
