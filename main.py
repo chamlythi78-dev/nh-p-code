@@ -172,12 +172,13 @@ _tab_queue: asyncio.Queue | None = None
 _pool_lock = asyncio.Lock()
 _in_use = 0
 _tab_refreshed: dict = {}
-_tab_force_reload: set = set()  # tab bị lỗi captcha -> reload sạch khi trả về pool
+_tab_force_reload: set = set()
+_batch_active = [0]   # đang nhập code thì tạm dừng tải lại tab nền
 _tab_sem: asyncio.Semaphore | None = None
 _inflight_codes: set[str] = set()
 _dead_codes: dict[str, float] = {}
 _fire_tasks: set = set()
-TAB_MAX_AGE = 240
+TAB_MAX_AGE = 20            # tab rảnh quá 20s là tự tải lại trang (luôn tươi, captcha không bị cũ)
 DEAD_CODE_TTL = 120
 DEAD_CODE_RX = re.compile(
     r"mã code không đúng|không còn hợp lệ|đã được sử dụng|đã sử dụng|hết lượt|hết hạn|không tồn tại",
@@ -435,8 +436,8 @@ async def return_warm_page(page, from_pool: bool):
     global _in_use
     if from_pool:
         _in_use = max(0, _in_use - 1)
-    force = page in _tab_force_reload
     _tab_force_reload.discard(page)
+    force = True   # xong việc là tải lại trang ngay, tab nào ra pool cũng là tab mới tinh
     if not page or page.is_closed():
         return
     if not from_pool or _tab_queue is None:
@@ -475,7 +476,7 @@ async def _reload_and_return(page):
 
 async def _keepalive_tabs():
     """Giữ các tab luôn tươi; mỗi vòng chỉ làm mới tối đa 2 tab cũ để luôn còn ít nhất 4 tab sẵn."""
-    if _tab_queue is None:
+    if _tab_queue is None or _batch_active[0] > 0:
         return
     pages = []
     for _ in range(_tab_queue.qsize()):
@@ -489,7 +490,7 @@ async def _keepalive_tabs():
             _tab_refreshed.pop(page, None)
             continue
         stale = time.time() - _tab_refreshed.get(page, 0) > TAB_MAX_AGE
-        if stale and len(to_reload) < 2:
+        if stale and len(to_reload) < 1:
             to_reload.append(page)
         else:
             await _tab_queue.put(page)
@@ -506,7 +507,7 @@ async def warm_pool_loop():
             await init_browser_pool(WARM_TAB_COUNT)
         except Exception as ex:
             print(f"Lỗi duy trì pool tab: {ex}")
-        await asyncio.sleep(30)
+        await asyncio.sleep(4)
 
 
 # =====================================================================
@@ -2005,7 +2006,6 @@ async def _captcha_image_bytes(page, captcha_input) -> bytes:
 async def _fill_input_reliable(page, locator_first, value: str):
     """Điền giá trị vào ô nhập và kích hoạt sự kiện input/change để web nhận chắc chắn."""
     await locator_first.click(timeout=3000)
-    await locator_first.fill("")
     await locator_first.fill(value)
     try:
         await locator_first.evaluate(
@@ -2075,34 +2075,46 @@ POPUP_SELECTORS = (
 )
 
 
+_POPUP_JS = r"""(sels) => {
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const st = getComputedStyle(el);
+    return st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const out = [];
+  for (const sel of sels) {
+    let els;
+    try { els = document.querySelectorAll(sel); } catch (e) { continue; }
+    for (let i = els.length - 1; i >= 0; i--) {
+      if (vis(els[i])) { const t = els[i].innerText; if (t && t.trim()) out.push(t); }
+    }
+  }
+  const closers = Array.from(document.querySelectorAll('button, a, div, span, p'))
+    .filter(n => vis(n) && /^\s*đóng\s*$/i.test(n.innerText || ''));
+  for (let i = closers.length - 1; i >= 0; i--) {
+    let a = closers[i].parentElement, found = null;
+    while (a && a !== document.body) {
+      if ((a.innerText || '').includes('Chăm sóc khách hàng')) { found = a; break; }
+      a = a.parentElement;
+    }
+    if (!found) found = closers[i].parentElement && closers[i].parentElement.parentElement;
+    if (found && found.innerText) out.push(found.innerText);
+  }
+  return out;
+}"""
+
+
 async def _popup_text(page) -> str:
-    for sel in POPUP_SELECTORS:
-        try:
-            loc = page.locator(sel)
-            count = await loc.count()
-            for idx in range(count - 1, -1, -1):
-                item = loc.nth(idx)
-                if await item.is_visible():
-                    txt = _format_notice_lines(await item.inner_text())
-                    if txt:
-                        return txt
-        except Exception:
-            continue
+    """Đọc nội dung popup đang hiện bằng ĐÚNG 1 lần gọi trình duyệt (nhanh hơn nhiều)."""
     try:
-        close_btn = page.get_by_text(re.compile(r"^\s*đóng\s*$", re.I))
-        total = await close_btn.count()
-        for i in range(total - 1, -1, -1):
-            el = close_btn.nth(i)
-            if not await el.is_visible():
-                continue
-            box = el.locator("xpath=ancestor::*[contains(normalize-space(.), 'Chăm sóc khách hàng')][1]")
-            if await box.count() == 0:
-                box = el.locator("xpath=../..")
-            txt = _format_notice_lines(await box.first.inner_text())
-            if txt:
-                return txt
+        texts = await page.evaluate(_POPUP_JS, list(POPUP_SELECTORS))
     except Exception:
-        pass
+        return ""
+    for raw in texts or []:
+        txt = _format_notice_lines(raw)
+        if txt:
+            return txt
     return ""
 
 
@@ -2222,8 +2234,6 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
     if page.url.rstrip("/") != TARGET_URL.rstrip("/") or await code_input.count() == 0:
         await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=15000)
     await code_input.first.wait_for(state="visible", timeout=5000)
-
-    await _reset_page_state_fast(page)
 
     # BƯỚC 1: điền code + tài khoản
     await _fill_input_reliable(page, code_input.first, clean_code)
@@ -2577,7 +2587,11 @@ async def dispatch_codes_to_accounts(codes: list[str], source_label: str):
     ))
     if not accounts:
         return
-    await _run_accounts(accounts, cleaned_codes)
+    _batch_active[0] += 1
+    try:
+        await _run_accounts(accounts, cleaned_codes)
+    finally:
+        _batch_active[0] -= 1
 
 
 # =====================================================================
