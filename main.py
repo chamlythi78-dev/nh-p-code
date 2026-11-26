@@ -60,6 +60,7 @@ MAX_BATCH = 30
 ORDER_TIMEOUT_HOURS = 72
 PAGE_SIZE = 8
 WARM_TAB_COUNT = int(os.getenv("WARM_TAB_COUNT", "6"))
+SPARE_TAB_COUNT = int(os.getenv("SPARE_TAB_COUNT", "2"))  # tab dự phòng luôn mở sẵn, đặt 0 nếu thiếu RAM
 
 # Hỗ trợ
 SUPPORT_GROUP = "khututricvx"
@@ -323,7 +324,7 @@ async def init_browser_pool(tab_count: int = WARM_TAB_COUNT):
                     _tab_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-        target_total = max(1, tab_count)
+        target_total = max(1, tab_count) + max(0, SPARE_TAB_COUNT)
         current_total = _tab_queue.qsize() + _in_use
         for _ in range(max(0, target_total - current_total)):
             try:
@@ -2072,7 +2073,7 @@ async def _refresh_until_loaded(page, captcha_input):
         await page.wait_for_timeout(300)
 
 
-async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 8) -> tuple[str, str]:
+async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: int = 8, stop_check=None) -> tuple[str, str]:
     """
     Trả về:
       SUCCESS - web báo nhập code thành công
@@ -2119,6 +2120,8 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
     # Captcha lỗi / không tải được / nhập sai -> bấm "Làm mới ảnh" lấy captcha mới rồi làm lại.
     last_notice = ""
     for _ in range(max_captcha_retry):
+        if stop_check and stop_check():
+            return "SKIP", "Tài khoản đã nhập thành công bằng code khác"
         if not await _captcha_modal_visible(captcha_input):
             popup = await _popup_text(page)
             if _is_code_verdict(popup):
@@ -2182,14 +2185,14 @@ async def report_attempt_to_admin(code: str, game_username: str, owner_id: int, 
         print(f"Không gửi được báo cáo cho admin: {ex}")
 
 
-async def _attempt_code(code: str, game_username: str, owner_id: int) -> tuple[str, str]:
+async def _attempt_code(code: str, game_username: str, owner_id: int, stop_check=None) -> tuple[str, str]:
     """
     Một lần thử = một tab riêng. Thử xong là nạp lại tab ở nền để trống chỗ cho lượt sau.
     Trả về (SUCCESS | FAIL | ERROR, ghi chú). ERROR = tab bị lỗi thao tác (không phải web trả lời).
     """
     async def _run(page) -> tuple[str, str]:
         try:
-            return await thu_mot_code(page, code, game_username)
+            return await thu_mot_code(page, code, game_username, stop_check=stop_check)
         except Exception as ex:
             print(f"Lỗi tab khi nhập {code} cho {game_username}: {ex}")  # chi tiết kỹ thuật chỉ ghi log
             try:
@@ -2237,7 +2240,10 @@ async def _mark_account_done(acc, code: str):
             f"{e('fire')} <b>NHẬP CODE THÀNH CÔNG!</b> {e('top')}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{e('pc')} Tài khoản: <code>{escape(game_user)}</code>\n"
-            f"{e('new')} Mã code: <code>{escape(code)}</code>",
+            f"{e('new')} Mã code: <code>{escape(code)}</code>\n"
+            f"{SEP}\n"
+            f"{e('ok')} Đơn hàng đã <b>hoàn tất</b> và được xoá khỏi danh sách chờ.\n"
+            f"{e('bulb')} <i>Muốn nhập code lại cho tài khoản này, vui lòng mua lại.</i>",
         ))
 
 
@@ -2256,6 +2262,7 @@ async def _run_accounts(accounts, codes: list[str]):
     tried: set[tuple[int, str]] = set()    # cặp (tài khoản, code) đã thử
     assigned: dict[int, int] = {aid: 0 for aid in accs}
     active = [0]                           # số tab đang chạy trong đợt này
+    stats = {"SUCCESS": 0, "FAIL": 0, "RETRY": 0}
 
     def pick():
         for code in codes:
@@ -2295,15 +2302,20 @@ async def _run_accounts(accounts, codes: list[str]):
                     if aid in done:
                         break  # tài khoản đã thành công bằng code khác
                     async with _get_tab_sem():
-                        status, note = await _attempt_code(code, game_user, owner_id)
-                    if status in ("SUCCESS", "FAIL"):
+                        status, note = await _attempt_code(
+                            code, game_user, owner_id, stop_check=lambda: aid in done
+                        )
+                    if status in ("SUCCESS", "FAIL", "SKIP"):
                         break
                     await asyncio.sleep(0.3)
+                if status == "SKIP" or (aid in done and status != "SUCCESS"):
+                    continue  # tài khoản đã xong bằng code khác, không báo thất bại
                 if status not in ("SUCCESS", "FAIL"):
                     note = clean_text(note) or "Chưa vượt qua được bước captcha"
                     note += f" | đã nhập lại {MAX_ATTEMPTS_PER_CODE} lần"
 
                 ok = status == "SUCCESS"
+                stats[status if status in ("SUCCESS", "FAIL") else "RETRY"] += 1
                 if ok:
                     done.add(aid)
                     dead.add(code)
@@ -2326,6 +2338,14 @@ async def _run_accounts(accounts, codes: list[str]):
     worker_count = max(1, min(WARM_TAB_COUNT, len(accs) * len(codes)))
     await asyncio.gather(*(worker() for _ in range(worker_count)), return_exceptions=True)
 
+    fire(bot.send_message(
+        ADMIN_ID,
+        f"{e('chart')} <b>TỔNG KẾT ĐỢT CODE</b>\n"
+        f"{SEP}\n"
+        f"{e('ok')} Tài khoản thành công: <b>{len(done)}/{len(accs)}</b>\n"
+        f"{e('no')} Code web báo sai/hết hạn: <b>{stats['FAIL']}</b>\n"
+        f"{e('reload')} Code chưa qua captcha: <b>{stats['RETRY']}</b>",
+    ))
     for aid, acc in accs.items():
         if aid in done:
             continue
