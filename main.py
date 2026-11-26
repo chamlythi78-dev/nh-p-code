@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import glob
 import math
 import os
@@ -2155,6 +2156,20 @@ def _get_captcha_gate() -> asyncio.Semaphore:
     return _captcha_gate
 
 
+_captcha_throttle_until = 0.0   # khi web bắt đầu chặn captcha -> tạm giới hạn số tab xin cùng lúc
+
+
+@contextlib.asynccontextmanager
+async def captcha_gate():
+    """Bình thường: KHÔNG giới hạn, bắn đồng loạt tất cả tab. Nếu vừa bị web chặn captcha thì
+    trong 2 phút tự giảm xuống CAPTCHA_CONCURRENCY tab xin cùng lúc."""
+    if time.time() < _captcha_throttle_until:
+        async with _get_captcha_gate():
+            yield
+    else:
+        yield
+
+
 CAPTCHA_ERR_RX = re.compile(r"không tải được captcha|tải captcha|làm mới hoặc thử lại", re.I)
 MAX_ATTEMPTS_PER_CODE = 4   # tối đa 4 lần, MỖI LẦN MỘT TAB KHÁC NHAU
 MAX_ROUNDS_PER_CODE = int(os.getenv("MAX_ROUNDS_PER_CODE", "3"))   # code lỗi captcha được chuyển sang tài khoản chưa xong tối đa mấy vòng
@@ -2216,7 +2231,7 @@ async def thu_mot_code(page, code: str, game_username: str, max_captcha_retry: i
 
     # BƯỚC 2+3: bấm KIỂM TRA và chờ ảnh captcha tải xong.
     # Chỉ cho vài tab xin captcha cùng lúc (web chặn khi xin dồn dập); tải xong là nhả cổng ngay.
-    async with _get_captcha_gate():
+    async with captcha_gate():
         if not await click_text_button(page, r"kiểm tra", below=user_input.first):
             return "RETRY", "Không tìm thấy nút Kiểm tra trên web"
 
@@ -2325,7 +2340,10 @@ async def _attempt_code(code: str, game_username: str, owner_id: int, stop_check
     try:
         status, note = await _run(page)
         if status == "ERROR" or CAPTCHA_LOAD_FAIL in (note or ""):
-            _tab_force_reload.add(page)   # tab lỗi => reload sạch khi trả về pool
+            _tab_force_reload.add(page)   # tab lỗi => reload sạch khi trả về
+            if CAPTCHA_LOAD_FAIL in (note or ""):
+                global _captcha_throttle_until
+                _captcha_throttle_until = time.time() + 120   # web đang chặn -> giảm tốc 2 phút pool
         return status, note
     finally:
         fire(return_warm_page(page, from_pool))
